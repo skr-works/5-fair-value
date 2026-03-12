@@ -1103,24 +1103,26 @@ def compute_outputs(db: Dict[str, Any]) -> Dict[str, Any]:
 
     if fair_price is None or current_price is None:
         overall_judgement = "算出不能"
-    elif financial_flag == 1:
-        if roe_normalized is None or coe is None or roe_normalized <= coe:
-            overall_judgement = "改善待ち"
-        elif buy_limit_price is not None and current_price <= buy_limit_price and confidence != "低":
-            overall_judgement = "割安候補"
-        elif current_price <= fair_price:
-            overall_judgement = "妥当"
-        else:
-            overall_judgement = "期待先行"
+    elif financial_flag == 1 and (roe_normalized is None or coe is None or roe_normalized <= coe):
+        overall_judgement = "見送り"
+    elif financial_flag == 0 and (roic_normalized is None or wacc is None or roic_normalized <= wacc):
+        overall_judgement = "見送り"
+    elif buy_limit_price is None:
+        overall_judgement = "算出不能"
+    elif current_price <= buy_limit_price * 0.90:
+        overall_judgement = "強い割安"
+    elif current_price <= buy_limit_price:
+        overall_judgement = "割安"
+    elif current_price <= fair_price * 0.90:
+        overall_judgement = "やや割安"
+    elif current_price <= fair_price * 1.10:
+        overall_judgement = "妥当"
+    elif current_price <= fair_price * 1.30:
+        overall_judgement = "やや割高"
+    elif current_price <= fair_price * 1.60:
+        overall_judgement = "割高"
     else:
-        if roic_normalized is None or wacc is None or roic_normalized <= wacc:
-            overall_judgement = "改善待ち"
-        elif buy_limit_price is not None and current_price <= buy_limit_price and confidence != "低":
-            overall_judgement = "割安候補"
-        elif current_price <= fair_price:
-            overall_judgement = "妥当"
-        else:
-            overall_judgement = "期待先行"
+        overall_judgement = "かなり割高"
 
     return {
         "適正株価": fair_price,
