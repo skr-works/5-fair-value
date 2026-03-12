@@ -39,6 +39,9 @@ EVAL_HEADERS = [
     "金融_市場織込ROE",               # S
     "金融_判定",                      # T
     "E/F 乖離率",                     # U
+    "保守適正株価",                   # V
+    "現在株価との差異率（保守）",     # W
+    "保守判定",                       # X
 ]
 
 DB_HEADERS = [
@@ -670,10 +673,15 @@ def fetch_ticker_data(ticker: str, refresh_full: bool) -> Dict[str, Any]:
             "notes": " | ".join(notes),
         }
 
-        required_keys = [
-            "current_price", "market_cap", "shares_outstanding", "bps",
-            "roic_normalized", "wacc", "nopat_ttm"
-        ]
+        if financial_flag == 1:
+            required_keys = [
+                "current_price", "bps", "roe_normalized", "coe"
+            ]
+        else:
+            required_keys = [
+                "current_price", "market_cap", "shares_outstanding", "bps",
+                "roic_normalized", "wacc", "nopat_ttm"
+            ]
         missing_fields = [k for k in required_keys if data.get(k) is None]
     else:
         data = {
@@ -857,6 +865,13 @@ def compute_financial_fair_price(db: Dict[str, Any]) -> Tuple[Optional[float], O
     spread = None
     judgement = "算出不能"
 
+    if bps is None:
+        with_note(notes, "金融算出不能: BPS不足。")
+    if roe is None:
+        with_note(notes, "金融算出不能: 平準化ROE不足。")
+    if coe is None:
+        with_note(notes, "金融算出不能: CoE不足。")
+
     if roe is not None and coe is not None:
         spread = roe - coe
 
@@ -867,6 +882,7 @@ def compute_financial_fair_price(db: Dict[str, Any]) -> Tuple[Optional[float], O
             if justified_pbr is not None and justified_pbr < 0:
                 justified_pbr = None
         else:
+            with_note(notes, "金融算出不能: CoE <= g のため正当PBR算出不能。")
             with_note(notes, "金融正当PBRは CoE <= g のため算出不能。")
 
     if justified_pbr is not None and bps is not None:
@@ -889,6 +905,93 @@ def compute_financial_fair_price(db: Dict[str, Any]) -> Tuple[Optional[float], O
         judgement = "期待先行"
 
     return coe, roe, spread, justified_pbr, fair_price, implied_roe, judgement, notes
+
+
+def compute_nonfinancial_conservative_price(db: Dict[str, Any]) -> Optional[float]:
+    roic_normalized = safe_float(db.get("roic_normalized"))
+    roic_1y = safe_float(db.get("roic_1y"))
+    wacc = safe_float(db.get("wacc"))
+    coe = safe_float(db.get("coe"))
+    invested_capital = safe_float(db.get("invested_capital"))
+    shares = safe_float(db.get("shares_outstanding"))
+    net_debt = safe_float(db.get("net_debt")) or 0.0
+    growth_base = safe_float(db.get("growth_base"))
+
+    roic_candidates = [v for v in [roic_normalized, roic_1y] if v is not None]
+    if not roic_candidates:
+        return None
+    roic_cons = min(roic_candidates)
+
+    discount_candidates = [v for v in [
+        (wacc + 0.015) if wacc is not None else None,
+        coe
+    ] if v is not None]
+    if not discount_candidates or invested_capital is None or shares in (None, 0):
+        return None
+    discount_cons = max(discount_candidates)
+
+    g_candidates = [v for v in [
+        growth_base,
+        0.03,
+        discount_cons - 0.03,
+    ] if v is not None]
+    if not g_candidates:
+        return None
+    g_cons = clip(min(g_candidates), 0.0, 0.03)
+
+    ev = invested_capital
+    ic = invested_capital
+    base_spread = roic_cons - discount_cons
+    for year in range(1, 6):
+        ic = ic * (1 + (g_cons or 0.0))
+        spread_t = base_spread * ((6 - year) / 5)
+        ep = spread_t * ic
+        ev += ep / ((1 + discount_cons) ** year)
+
+    equity_value = ev - net_debt
+    if equity_value <= 0:
+        return None
+    return safe_div(equity_value, shares)
+
+
+def compute_financial_conservative_price(db: Dict[str, Any]) -> Optional[float]:
+    roe_normalized = safe_float(db.get("roe_normalized"))
+    roe_1y = safe_float(db.get("roe_1y"))
+    coe = safe_float(db.get("coe"))
+    bps = safe_float(db.get("bps"))
+    payout_ratio = safe_float(db.get("payout_ratio"))
+
+    roe_candidates = [v for v in [roe_normalized, roe_1y] if v is not None]
+    if not roe_candidates or bps is None:
+        return None
+    roe_cons = min(roe_candidates)
+
+    coe_candidates = [v for v in [
+        (coe + 0.015) if coe is not None else None,
+        0.08,
+    ] if v is not None]
+    if not coe_candidates:
+        return None
+    coe_cons = max(coe_candidates)
+
+    payout_cons = payout_ratio
+    if payout_cons is not None and payout_cons < 0:
+        payout_cons = None
+    if payout_cons is not None and payout_cons > 1.0:
+        payout_cons = 1.0
+
+    retained_growth = roe_cons * (1 - (payout_cons if payout_cons is not None else 0.5))
+    g_candidates = [v for v in [retained_growth, 0.02, coe_cons - 0.02] if v is not None]
+    if not g_candidates:
+        return None
+    g_cons = clip(min(g_candidates), 0.0, 0.02)
+
+    if coe_cons <= g_cons:
+        return None
+    justified_pbr_cons = safe_div((roe_cons - g_cons), (coe_cons - g_cons))
+    if justified_pbr_cons is None or justified_pbr_cons < 0:
+        return None
+    return bps * justified_pbr_cons
 
 
 def compute_outputs(db: Dict[str, Any]) -> Dict[str, Any]:
@@ -938,6 +1041,42 @@ def compute_outputs(db: Dict[str, Any]) -> Dict[str, Any]:
     if safe_float(db.get("roic_normalized")) is not None and safe_float(db.get("wacc")) is not None:
         roic_wacc_spread = safe_float(db.get("roic_normalized")) - safe_float(db.get("wacc"))
 
+    conservative_price_raw = None
+    if financial_flag == 1:
+        conservative_price_raw = compute_financial_conservative_price(db)
+    else:
+        conservative_price_raw = compute_nonfinancial_conservative_price(db)
+
+    if integrated_price is not None and conservative_price_raw is not None:
+        conservative_price = min(conservative_price_raw, integrated_price)
+    else:
+        conservative_price = conservative_price_raw or integrated_price
+
+    conservative_diff_rate = safe_div((current_price - conservative_price), conservative_price) if current_price is not None and conservative_price else None
+
+    if financial_flag == 1:
+        if conservative_price is None:
+            conservative_judgement = "算出不能"
+        elif fin_spread is None or fin_spread <= 0:
+            conservative_judgement = "改善待ち"
+        elif conservative_diff_rate is not None and conservative_diff_rate <= -0.20 and fin_implied_roe is not None and fin_roe is not None and fin_implied_roe <= fin_roe + 0.03:
+            conservative_judgement = "割安候補"
+        elif conservative_diff_rate is not None and -0.20 < conservative_diff_rate < 0.15:
+            conservative_judgement = "妥当"
+        else:
+            conservative_judgement = "期待先行"
+    else:
+        if conservative_price is None:
+            conservative_judgement = "算出不能"
+        elif roic_wacc_spread is None or roic_wacc_spread <= 0:
+            conservative_judgement = "改善待ち"
+        elif conservative_diff_rate is not None and conservative_diff_rate <= -0.25 and (implied_growth is None or implied_growth < 0.10) and (implied_gap_years is None or implied_gap_years < 10):
+            conservative_judgement = "割安候補"
+        elif conservative_diff_rate is not None and -0.25 < conservative_diff_rate < 0.15:
+            conservative_judgement = "妥当"
+        else:
+            conservative_judgement = "期待先行"
+
     db["implied_growth_rate"] = implied_growth
     db["implied_gap_years"] = implied_gap_years
     db["financial_roe_avg"] = fin_roe
@@ -966,12 +1105,15 @@ def compute_outputs(db: Dict[str, Any]) -> Dict[str, Any]:
         "金融_市場織込ROE": fin_implied_roe,
         "金融_判定": fin_judgement,
         "E/F 乖離率": ef_divergence,
+        "保守適正株価": conservative_price,
+        "現在株価との差異率（保守）": conservative_diff_rate,
+        "保守判定": conservative_judgement,
     }
 
 
 def ensure_headers(ws: gspread.Worksheet) -> Tuple[Dict[str, int], Dict[str, int]]:
-    # E1:U1
-    ws.update("E1:U1", [EVAL_HEADERS], value_input_option="USER_ENTERED")
+    # E1:X1
+    ws.update("E1:X1", [EVAL_HEADERS], value_input_option="USER_ENTERED")
     db_start_col = 27  # AA
     db_end_col = db_start_col + len(DB_HEADERS) - 1
     db_range = f"AA1:{column_letter(db_end_col)}1"
@@ -1070,6 +1212,7 @@ def main() -> None:
             outputs = {key: "" for key in EVAL_HEADERS}
             outputs["総合判定"] = "算出不能"
             outputs["金融_判定"] = "算出不能"
+            outputs["保守判定"] = "算出不能"
 
         output_matrix.append([serialize_cell(outputs.get(h)) for h in EVAL_HEADERS])
         db_matrix.append([serialize_cell(db.get(h)) for h in DB_HEADERS])
@@ -1087,7 +1230,6 @@ def main() -> None:
         db_matrix,
         value_input_option="USER_ENTERED",
     )
-
 
 
 if __name__ == "__main__":
