@@ -2,13 +2,18 @@ import json
 import logging
 import math
 import os
+import random
+import re
+import time
 from datetime import datetime
+from io import StringIO
 from zoneinfo import ZoneInfo
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 import gspread
 import numpy as np
 import pandas as pd
+import requests
 import yfinance as yf
 from google.oauth2.service_account import Credentials
 from scipy.optimize import bisect
@@ -20,6 +25,16 @@ SHEET_SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
     "https://www.googleapis.com/auth/drive",
 ]
+SBI_JP10Y_URL = "https://www.sbisec.co.jp/ETGate/?_ControlID=WPLETmgR001Control&_PageID=WPLETmgR001Mdtl20&_DataStoreID=DSWPLETmgR001Control&_ActionID=DefaultAID&burl=iris_indexDetail&cat1=market&cat2=index&dir=tl1-idxdtl%7Ctl2-JP10YT%3DXX%7Ctl5-jpn&file=index.html&getFlg=on"
+SBI_USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:135.0) Gecko/20100101 Firefox/135.0",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_3) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.3 Safari/605.1.15",
+]
+_RF_RATE_CACHE: Optional[float] = None
+_RF_RATE_SOURCE = ""
 
 EVAL_HEADERS = [
     "適正株価",                # E
@@ -135,6 +150,8 @@ LABELS = {
     "debt": ["Total Debt", "Long Term Debt And Capital Lease Obligation", "Current Debt And Capital Lease Obligation"],
     "operating_cf": ["Operating Cash Flow", "Cash Flow From Continuing Operating Activities", "Net Cash Provided By Operating Activities"],
     "capex": ["Capital Expenditure", "Capital Expenditures"],
+    "pretax_income": ["Pretax Income", "Pre-Tax Income", "Pretax Earnings"],
+    "tax_provision": ["Tax Provision", "Provision For Income Taxes", "Income Tax Expense"],
 }
 
 logging.basicConfig(
@@ -235,12 +252,12 @@ def average(values: List[Optional[float]]) -> Optional[float]:
 
 
 def median_or_single(values: List[Optional[float]]) -> Optional[float]:
-    vals = [v for v in values if v is not None]
+    vals = [v for v in values if v is not None and v > 0]
     if not vals:
         return None
     if len(vals) == 1:
         return vals[0]
-    return float(sum(vals) / len(vals))
+    return float(np.median(vals))
 
 
 def normalize_code(code: Any) -> str:
@@ -303,11 +320,21 @@ def first_matching_row(df: Optional[pd.DataFrame], labels: List[str]) -> Optiona
     return None
 
 
+def _sorted_numeric_series(row: pd.Series, newest_first: bool = True) -> pd.Series:
+    cleaned = pd.to_numeric(row, errors="coerce")
+    try:
+        cleaned.index = pd.to_datetime(cleaned.index)
+        cleaned = cleaned.sort_index(ascending=not newest_first)
+    except Exception:
+        pass
+    return cleaned.dropna()
+
+
 def latest_series_value(df: Optional[pd.DataFrame], labels: List[str]) -> Optional[float]:
     row = first_matching_row(df, labels)
     if row is None:
         return None
-    cleaned = pd.to_numeric(row, errors="coerce").dropna()
+    cleaned = _sorted_numeric_series(row, newest_first=True)
     if cleaned.empty:
         return None
     return safe_float(cleaned.iloc[0])
@@ -317,8 +344,18 @@ def sum_recent_quarters(df: Optional[pd.DataFrame], labels: List[str], limit: in
     row = first_matching_row(df, labels)
     if row is None:
         return None
-    cleaned = pd.to_numeric(row, errors="coerce").dropna()
+    cleaned = _sorted_numeric_series(row, newest_first=True)
     if cleaned.empty:
+        return None
+    try:
+        idx = pd.to_datetime(cleaned.index)
+        if len(idx) > 0:
+            latest_dt = idx[0]
+            cutoff = latest_dt - pd.Timedelta(days=400)
+            cleaned = cleaned[idx >= cutoff]
+    except Exception:
+        pass
+    if len(cleaned) < limit:
         return None
     return safe_float(cleaned.iloc[:limit].sum())
 
@@ -331,11 +368,46 @@ def get_annual_values(df: Optional[pd.DataFrame], labels: List[str], periods: in
     row = first_matching_row(df, labels)
     if row is None:
         return []
-    cleaned = pd.to_numeric(row, errors="coerce")
+    cleaned = _sorted_numeric_series(row, newest_first=True)
     values = []
     for v in cleaned.iloc[:periods]:
         values.append(safe_float(v))
     return values
+
+
+def normalize_capex(raw_capex: Optional[float]) -> Optional[float]:
+    if raw_capex is None:
+        return None
+    return -abs(raw_capex)
+
+
+def compute_cagr(values: List[Optional[float]]) -> Optional[float]:
+    vals = [v for v in values if v is not None]
+    if len(vals) < 2:
+        return None
+    last = vals[0]
+    max_years = min(3, len(vals) - 1)
+    base = vals[max_years]
+    years = max_years
+    if base is None or last is None or base <= 0 or last <= 0 or years <= 0:
+        return None
+    try:
+        return (last / base) ** (1 / years) - 1
+    except Exception:
+        return None
+
+
+def get_optional_config_rate(config: Dict[str, Any], key: str, default: float) -> float:
+    return safe_float(config.get(key)) or default
+
+
+def parse_missing_fields(value: Any) -> Set[str]:
+    if value is None:
+        return set()
+    text = str(value).strip()
+    if not text:
+        return set()
+    return {part.strip() for part in text.split(",") if part.strip()}
 
 
 def compute_annual_roe_series(income_stmt: Optional[pd.DataFrame], balance_sheet: Optional[pd.DataFrame]) -> List[Optional[float]]:
@@ -387,20 +459,26 @@ def compute_two_year_weekly_beta(ticker: str, benchmark: str = BENCHMARK_TICKER)
         if ticker not in closes.columns or benchmark not in closes.columns:
             return None
         returns = closes[[ticker, benchmark]].pct_change().dropna()
-        if len(returns) < 30:
+        if len(returns) < 52:
             return None
         cov = np.cov(returns[ticker], returns[benchmark])[0, 1]
         var = np.var(returns[benchmark])
         if var == 0:
             return None
-        beta = cov / var
+        beta_raw = cov / var
+        beta = 0.67 * beta_raw + 0.33 * 1.0
+        beta = clip(beta, 0.30, 2.00)
         return safe_float(beta)
     except Exception:
         return None
 
 
-def detect_financial_flag(sector_raw: Optional[str], industry_raw: Optional[str]) -> int:
+def detect_financial_flag(sector_raw: Optional[str], industry_raw: Optional[str], quote_type: Optional[str]) -> int:
+    if str(quote_type or "").upper() in {"ETF", "MUTUALFUND"}:
+        return 0
     text = f"{sector_raw or ''} {industry_raw or ''}".lower()
+    if any(keyword in text for keyword in ["reit", "real estate investment trust", "不動産投資信託"]):
+        return 0
     return 1 if any(keyword.lower() in text for keyword in FINANCIAL_KEYWORDS) else 0
 
 
@@ -417,7 +495,87 @@ def get_info_value(info: Dict[str, Any], keys: List[str]) -> Any:
     return None
 
 
-def fetch_ticker_data(ticker: str, refresh_full: bool) -> Dict[str, Any]:
+def _extract_percent_from_text(text: str) -> Optional[float]:
+    patterns = [
+        r"JP10YT=XX.{0,300}?(-?\d+(?:\.\d+)?)\s*%",
+        r"(?:日本\s*10年|日本10年|10年国債|長期金利).{0,200}?(-?\d+(?:\.\d+)?)\s*%",
+    ]
+    for pattern in patterns:
+        m = re.search(pattern, text, flags=re.IGNORECASE | re.DOTALL)
+        if m:
+            value = safe_float(m.group(1))
+            if value is not None:
+                rate = value / 100.0
+                if 0.0 <= rate <= 0.10:
+                    return rate
+    return None
+
+
+def fetch_rf_rate_japan_from_sbi() -> float:
+    global _RF_RATE_CACHE, _RF_RATE_SOURCE
+    if _RF_RATE_CACHE is not None:
+        return _RF_RATE_CACHE
+
+    for attempt in range(3):
+        headers = {
+            "User-Agent": random.choice(SBI_USER_AGENTS),
+            "Accept-Language": "ja,en-US;q=0.9,en;q=0.8",
+            "Cache-Control": "no-cache",
+            "Pragma": "no-cache",
+        }
+        try:
+            response = requests.get(SBI_JP10Y_URL, headers=headers, timeout=10)
+            response.raise_for_status()
+            response.encoding = response.apparent_encoding or response.encoding
+            html = response.text
+
+            rate = _extract_percent_from_text(html)
+            if rate is None:
+                try:
+                    tables = pd.read_html(StringIO(html))
+                except Exception:
+                    tables = []
+                for table in tables:
+                    for _, row in table.astype(str).iterrows():
+                        row_text = " ".join(row.tolist())
+                        if any(label in row_text for label in ["JP10YT=XX", "日本 10年", "日本10年", "10年国債", "長期金利"]):
+                            match = re.search(r"(-?\d+(?:\.\d+)?)\s*%", row_text)
+                            if match:
+                                value = safe_float(match.group(1))
+                                if value is not None:
+                                    candidate = value / 100.0
+                                    if 0.0 <= candidate <= 0.10:
+                                        rate = candidate
+                                        break
+                    if rate is not None:
+                        break
+            if rate is None:
+                for label in ["日本 10年", "日本10年", "10年国債", "長期金利"]:
+                    match = re.search(label + r".{0,200}?(-?\d+(?:\.\d+)?)\s*%", html, flags=re.IGNORECASE | re.DOTALL)
+                    if match:
+                        value = safe_float(match.group(1))
+                        if value is not None:
+                            candidate = value / 100.0
+                            if 0.0 <= candidate <= 0.10:
+                                rate = candidate
+                                break
+
+            if rate is not None:
+                _RF_RATE_CACHE = rate
+                _RF_RATE_SOURCE = "SBI"
+                return rate
+        except Exception:
+            pass
+
+        if attempt < 2:
+            time.sleep(2 ** attempt)
+
+    _RF_RATE_CACHE = 0.015
+    _RF_RATE_SOURCE = "FALLBACK"
+    return _RF_RATE_CACHE
+
+
+def fetch_ticker_data(ticker: str, refresh_full: bool, config: Dict[str, Any]) -> Dict[str, Any]:
     tk = yf.Ticker(ticker)
 
     info: Dict[str, Any] = {}
@@ -435,6 +593,11 @@ def fetch_ticker_data(ticker: str, refresh_full: bool) -> Dict[str, Any]:
         fast_info = dict(tk.fast_info) if getattr(tk, "fast_info", None) else {}
     except Exception:
         fast_info = {}
+
+    try:
+        price_hist = tk.history(period="5d", auto_adjust=False)
+    except Exception:
+        price_hist = pd.DataFrame()
 
     if refresh_full:
         try:
@@ -470,10 +633,14 @@ def fetch_ticker_data(ticker: str, refresh_full: bool) -> Dict[str, Any]:
         cashflow = quarterly_cashflow = pd.DataFrame()
         dividends = pd.Series(dtype="float64")
 
-    current_price = safe_float(
-        get_info_value(fast_info, ["lastPrice", "regularMarketPrice", "last_price"])
-        or get_info_value(info, ["currentPrice", "regularMarketPrice", "previousClose"])
-    )
+    current_price = None
+    if not price_hist.empty and "Close" in price_hist.columns:
+        current_price = safe_float(price_hist["Close"].dropna().iloc[-1]) if not price_hist["Close"].dropna().empty else None
+    if current_price is None:
+        current_price = safe_float(
+            get_info_value(fast_info, ["lastPrice", "regularMarketPrice", "last_price"])
+            or get_info_value(info, ["currentPrice", "regularMarketPrice", "previousClose"])
+        )
     market_cap = safe_float(
         get_info_value(fast_info, ["marketCap"])
         or get_info_value(info, ["marketCap"])
@@ -494,9 +661,20 @@ def fetch_ticker_data(ticker: str, refresh_full: bool) -> Dict[str, Any]:
 
     if refresh_full:
         revenue_ttm = sum_recent_quarters(quarterly_income_stmt, LABELS["revenue"])
+        if revenue_ttm is None:
+            revenue_ttm = latest_series_value(income_stmt, LABELS["revenue"])
+
         ebit_ttm = sum_recent_quarters(quarterly_income_stmt, LABELS["ebit"])
+        if ebit_ttm is None:
+            ebit_ttm = latest_series_value(income_stmt, LABELS["ebit"])
+
         ebitda_ttm = sum_recent_quarters(quarterly_income_stmt, LABELS["ebitda"])
+        if ebitda_ttm is None:
+            ebitda_ttm = latest_series_value(income_stmt, LABELS["ebitda"])
+
         net_income_ttm = sum_recent_quarters(quarterly_income_stmt, LABELS["net_income"])
+        if net_income_ttm is None:
+            net_income_ttm = latest_series_value(income_stmt, LABELS["net_income"])
 
         total_assets = latest_point_in_time(quarterly_balance_sheet, LABELS["assets"]) or latest_point_in_time(balance_sheet, LABELS["assets"])
         total_equity = latest_point_in_time(quarterly_balance_sheet, LABELS["equity"]) or latest_point_in_time(balance_sheet, LABELS["equity"])
@@ -504,9 +682,14 @@ def fetch_ticker_data(ticker: str, refresh_full: bool) -> Dict[str, Any]:
         total_debt = latest_point_in_time(quarterly_balance_sheet, LABELS["debt"]) or latest_point_in_time(balance_sheet, LABELS["debt"])
 
         operating_cf_ttm = sum_recent_quarters(quarterly_cashflow, LABELS["operating_cf"])
+        if operating_cf_ttm is None:
+            operating_cf_ttm = latest_series_value(cashflow, LABELS["operating_cf"])
+
         capex_ttm = sum_recent_quarters(quarterly_cashflow, LABELS["capex"])
-        if capex_ttm is not None and capex_ttm > 0:
-            capex_ttm *= -1
+        if capex_ttm is None:
+            capex_ttm = latest_series_value(cashflow, LABELS["capex"])
+        capex_ttm = normalize_capex(capex_ttm)
+
         fcf_ttm = None
         if operating_cf_ttm is not None and capex_ttm is not None:
             fcf_ttm = operating_cf_ttm + capex_ttm
@@ -519,7 +702,12 @@ def fetch_ticker_data(ticker: str, refresh_full: bool) -> Dict[str, Any]:
         if dps_ttm is None:
             dps_ttm = trailing_dividend_rate
 
+        pretax_income_ttm = sum_recent_quarters(quarterly_income_stmt, LABELS["pretax_income"])
+        tax_provision_ttm = sum_recent_quarters(quarterly_income_stmt, LABELS["tax_provision"])
         tax_rate_estimate = 0.30
+        if pretax_income_ttm is not None and tax_provision_ttm is not None and pretax_income_ttm > 0 and tax_provision_ttm >= 0:
+            tax_rate_estimate = clip(tax_provision_ttm / pretax_income_ttm, 0.20, 0.35) or 0.30
+
         nopat_ttm = None if ebit_ttm is None else ebit_ttm * (1 - tax_rate_estimate)
         net_debt = None
         if total_debt is not None or cash_and_equivalents is not None:
@@ -559,12 +747,17 @@ def fetch_ticker_data(ticker: str, refresh_full: bool) -> Dict[str, Any]:
         roic_normalized = roic_3y_avg or average(roic_series[:2]) or roic_1y
 
         beta = compute_two_year_weekly_beta(ticker) or raw_beta or 1.0
+        beta = clip(beta, 0.30, 2.00) or 1.0
         if raw_beta is None:
             with_note(notes, "βは2年週次推定を優先し、取得不能時はinfoのbeta→1.0で代替。業種平均フォールバックは未実装。")
 
-        rf_rate = 0.015
-        erp = 0.055
-        country_risk_premium = 0.0
+        rf_rate = fetch_rf_rate_japan_from_sbi()
+        if _RF_RATE_SOURCE == "SBI":
+            with_note(notes, "rf_rateはSBIの日本10年国債利回りを使用")
+        else:
+            with_note(notes, "rf_rateはSBI取得失敗のため固定値0.015を使用")
+        erp = get_optional_config_rate(config, "erp_override", 0.055)
+        country_risk_premium = get_optional_config_rate(config, "country_risk_premium_override", 0.0)
         size_premium = market_cap_size_premium(market_cap)
         coe = rf_rate + beta * erp + size_premium + country_risk_premium
         cod_estimate = 0.02 if total_debt and total_debt > 0 else 0.015
@@ -579,24 +772,39 @@ def fetch_ticker_data(ticker: str, refresh_full: bool) -> Dict[str, Any]:
         else:
             wacc = coe
 
-        growth_floor = 0.0
+        growth_floor = -0.02
         growth_cap = 0.15
         terminal_growth = 0.01
         gap_year_default = 5
 
         growth_candidates: List[Optional[float]] = []
         revenue_annual = get_annual_values(income_stmt, LABELS["revenue"], periods=4)
-        if len([v for v in revenue_annual if v is not None]) >= 2:
-            first = revenue_annual[min(2, len(revenue_annual) - 1)]
-            last = revenue_annual[0]
-            if first not in (None, 0) and last is not None and first > 0 and last > 0:
-                years = min(3, len(revenue_annual) - 1)
-                growth_candidates.append((last / first) ** (1 / years) - 1)
-        if roe_normalized is not None:
-            growth_candidates.append(min(max(roe_normalized * (1 - (payout_ratio or 0.5)), 0), growth_cap))
-        growth_base = clip(average(growth_candidates) or 0.03, growth_floor, growth_cap)
+        revenue_cagr = compute_cagr(revenue_annual)
+        if revenue_cagr is not None:
+            growth_candidates.append(clip(revenue_cagr, -0.02, growth_cap))
 
-        financial_flag = detect_financial_flag(sector_raw, industry_raw)
+        ebit_annual = get_annual_values(income_stmt, LABELS["ebit"], periods=4)
+        nopat_annual = [None if v is None else v * (1 - tax_rate_estimate) for v in ebit_annual]
+        nopat_cagr = compute_cagr(nopat_annual)
+        if nopat_cagr is not None:
+            growth_candidates.append(clip(nopat_cagr, -0.02, growth_cap))
+
+        if roe_normalized is not None:
+            payout_use = min(max(payout_ratio if payout_ratio is not None else 0.5, 0.0), 1.0)
+            retention_growth = roe_normalized * (1 - payout_use)
+            growth_candidates.append(clip(retention_growth, -0.02, growth_cap))
+
+        analyst_growth = safe_float(get_info_value(info, ["earningsGrowth", "revenueGrowth"]))
+        if analyst_growth is not None and -0.20 <= analyst_growth <= 0.20:
+            growth_candidates.append(clip(analyst_growth, -0.02, growth_cap))
+            with_note(notes, "analyst growthは補助候補のみ採用")
+
+        growth_values = [v for v in growth_candidates if v is not None]
+        growth_base = float(np.median(growth_values)) if growth_values else 0.03
+        growth_base = clip(growth_base, growth_floor, growth_cap)
+
+        financial_flag = detect_financial_flag(sector_raw, industry_raw, quote_type)
+        with_note(notes, "fcfe_ttmは未算出（fcf_ttmとの同一視を禁止）")
 
         data = {
             "ticker_yf": ticker,
@@ -629,7 +837,7 @@ def fetch_ticker_data(ticker: str, refresh_full: bool) -> Dict[str, Any]:
             "operating_cf_ttm": operating_cf_ttm,
             "capex_ttm": capex_ttm,
             "fcf_ttm": fcf_ttm,
-            "fcfe_ttm": fcf_ttm,
+            "fcfe_ttm": None,
             "eps_ttm": eps_ttm,
             "bps": bps,
             "dps_ttm": dps_ttm,
@@ -711,7 +919,7 @@ def merge_db(existing_db: Dict[str, Any], fresh: Dict[str, Any], refresh_full: b
     merged["pe_now"] = safe_div(current_price, eps_ttm)
 
     defaults = {
-        "growth_floor": 0.0,
+        "growth_floor": -0.02,
         "growth_cap": 0.15,
         "terminal_growth": 0.01,
         "gap_year_default": 5,
@@ -919,23 +1127,30 @@ def compute_decay_ep_price(db: Dict[str, Any]) -> Optional[float]:
         return None
     discount_use = max(discount_candidates)
 
-    growth_candidates = [v for v in [
-        growth_base,
-        0.04,
-        discount_use - 0.03,
-    ] if v is not None]
-    if not growth_candidates:
+    spread = roic_use - discount_use
+    if spread > 0.15:
+        decay_years = 7
+    elif spread > 0.08:
+        decay_years = 5
+    else:
+        decay_years = 3
+
+    growth_candidates = [
+        clip(growth_base, -0.02, 0.04),
+        clip(0.03, -0.02, 0.04),
+    ]
+    growth_vals = [v for v in growth_candidates if v is not None]
+    if not growth_vals:
         return None
-    growth_use = clip(min(growth_candidates), 0.0, 0.04)
+    growth_use = float(np.median(growth_vals))
 
     ev = invested_capital
     ic = invested_capital
-    base_spread = roic_use - discount_use
 
-    for year in range(1, 6):
-        ic = ic * (1 + (growth_use or 0.0))
-        decay_factor = (6 - year) / 5
-        ep = base_spread * decay_factor * ic
+    for year in range(1, decay_years + 1):
+        ic = ic * (1 + growth_use)
+        decay_factor = (decay_years + 1 - year) / decay_years
+        ep = spread * decay_factor * ic
         ev += ep / ((1 + discount_use) ** year)
 
     equity_value = ev - net_debt
@@ -948,10 +1163,12 @@ def compute_profit_anchor_price(db: Dict[str, Any]) -> Optional[float]:
     eps_ttm = safe_float(db.get("eps_ttm"))
     roic_normalized = safe_float(db.get("roic_normalized"))
     wacc = safe_float(db.get("wacc"))
+    growth_base = safe_float(db.get("growth_base"))
     if eps_ttm is None or roic_normalized is None or wacc is None:
         return None
     spread = max(roic_normalized - wacc, 0.0)
-    pe_target = clip(10 + 40 * spread, 8, 18)
+    growth_use = clip(max(growth_base or 0.0, 0.0), 0.0, 0.15) or 0.0
+    pe_target = clip(10 + 40 * spread + 25 * growth_use, 8, 25)
     price = eps_ttm * pe_target
     if price <= 0:
         return None
@@ -960,9 +1177,23 @@ def compute_profit_anchor_price(db: Dict[str, Any]) -> Optional[float]:
 
 def compute_asset_anchor_price(db: Dict[str, Any]) -> Optional[float]:
     bps = safe_float(db.get("bps"))
+    roe_normalized = safe_float(db.get("roe_normalized"))
+    roe_1y = safe_float(db.get("roe_1y"))
+    coe = safe_float(db.get("coe"))
+    if bps is None:
+        return None
+
+    roe_use = roe_normalized if roe_normalized is not None else roe_1y
+    if roe_use is not None and coe is not None:
+        spread = max(roe_use - coe, 0.0)
+        pb_target = clip(0.8 + 8 * spread, 0.8, 2.5)
+        price = bps * pb_target
+        if price > 0:
+            return price
+
     roic_normalized = safe_float(db.get("roic_normalized"))
     wacc = safe_float(db.get("wacc"))
-    if bps is None or roic_normalized is None or wacc is None:
+    if roic_normalized is None or wacc is None:
         return None
     spread = max(roic_normalized - wacc, 0.0)
     pb_target = clip(0.8 + 8 * spread, 0.8, 2.5)
@@ -1046,16 +1277,40 @@ def compute_financial_profit_anchor_price(db: Dict[str, Any]) -> Optional[float]
     return price
 
 
-def compute_model_confidence(candidate_prices: List[Optional[float]]) -> str:
+def compute_model_confidence(candidate_prices: List[Optional[float]], db: Dict[str, Any]) -> str:
     vals = [v for v in candidate_prices if v is not None and v > 0]
     if not vals:
-        return ""
-    if len(vals) == 1:
         return "低"
-    ratio = max(vals) / min(vals)
-    if len(vals) == 3 and ratio <= 1.8:
+
+    override = str(db.get("financial_flag_override") or "").strip()
+    auto_financial_flag = safe_int(db.get("financial_flag")) or 0
+    if override in {"0", "1"}:
+        financial_flag = int(override)
+    else:
+        financial_flag = auto_financial_flag
+
+    missing = parse_missing_fields(db.get("missing_fields"))
+    if financial_flag == 1:
+        critical = {"current_price", "bps", "roe_normalized", "coe"}
+    else:
+        critical = {"current_price", "bps", "roic_normalized", "wacc", "nopat_ttm"}
+    quality_penalty = len(critical & missing)
+
+    last_update = parse_datetime_jst(db.get("last_db_update_jst"))
+    stale = True if last_update is None else (datetime.now(JST) - last_update).days > 30
+
+    if quality_penalty >= 2 or len(vals) == 1:
+        return "低"
+
+    cv = None
+    if len(vals) >= 2:
+        mean_val = float(np.mean(vals))
+        if mean_val > 0:
+            cv = float(np.std(vals) / mean_val)
+
+    if len(vals) >= 3 and cv is not None and cv <= 0.20 and not stale and quality_penalty == 0:
         return "高"
-    if len(vals) == 2 or (len(vals) == 3 and ratio <= 2.5):
+    if len(vals) >= 2 and cv is not None and cv <= 0.40 and quality_penalty <= 1:
         return "中"
     return "低"
 
@@ -1094,7 +1349,7 @@ def compute_outputs(db: Dict[str, Any]) -> Dict[str, Any]:
 
     diff_rate = safe_div((current_price - fair_price), fair_price) if current_price is not None and fair_price else None
     buy_limit_diff_rate = safe_div((current_price - buy_limit_price), buy_limit_price) if current_price is not None and buy_limit_price else None
-    confidence = compute_model_confidence(candidate_prices)
+    confidence = compute_model_confidence(candidate_prices, db)
 
     roe_normalized = safe_float(db.get("roe_normalized"))
     coe = safe_float(db.get("coe"))
@@ -1214,7 +1469,7 @@ def main() -> None:
         refresh_full = should_refresh_db(existing_db, force=force_db_refresh)
 
         try:
-            fresh = fetch_ticker_data(ticker, refresh_full=refresh_full)
+            fresh = fetch_ticker_data(ticker, refresh_full=refresh_full, config=config)
             if not refresh_full:
                 fresh["last_db_update_jst"] = existing_db.get("last_db_update_jst")
                 if not fresh.get("financial_flag"):
