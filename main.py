@@ -22,26 +22,19 @@ SHEET_SCOPES = [
 ]
 
 EVAL_HEADERS = [
-    "Economic Profit 株価",            # E
-    "Value Driver Formula 株価",      # F
-    "Reverse DCF 市場織込成長率",     # G
-    "Reverse DCF GAP 年数",           # H
-    "ROIC-WACC スプレッド",           # I
-    "統合適正株価",                   # J
-    "現在株価との差異率",             # K
-    "総合判定",                       # L
-    "金融業種フラグ",                 # M
-    "金融_CoE",                       # N
-    "金融_平準化ROE",                 # O
-    "金融_ROE-CoEスプレッド",         # P
-    "金融_正当PBR",                   # Q
-    "金融_適正株価",                  # R
-    "金融_市場織込ROE",               # S
-    "金融_判定",                      # T
-    "E/F 乖離率",                     # U
-    "保守適正株価",                   # V
-    "現在株価との差異率（保守）",     # W
-    "保守判定",                       # X
+    "適正株価",                # E
+    "買い上限株価",            # F
+    "現在株価との差異率",      # G
+    "買い上限との差異率",      # H
+    "総合判定",                # I
+    "減衰EP株価",              # J
+    "利益アンカー株価",        # K
+    "純資産アンカー株価",      # L
+    "保守PBR株価",             # M
+    "配当割引株価",            # N
+    "金融利益アンカー株価",    # O
+    "金融業種フラグ",          # P
+    "モデル信頼度",            # Q
 ]
 
 DB_HEADERS = [
@@ -248,10 +241,6 @@ def median_or_single(values: List[Optional[float]]) -> Optional[float]:
     if len(vals) == 1:
         return vals[0]
     return float(sum(vals) / len(vals))
-
-
-def pct_or_none(value: Optional[float]) -> Optional[float]:
-    return value
 
 
 def normalize_code(code: Any) -> str:
@@ -715,14 +704,12 @@ def merge_db(existing_db: Dict[str, Any], fresh: Dict[str, Any], refresh_full: b
         elif refresh_full and key in DB_HEADERS and key not in ("financial_flag_override",):
             merged[key] = value
 
-    # daily refresh fields derived from price
     current_price = safe_float(merged.get("current_price"))
     bps = safe_float(merged.get("bps"))
     eps_ttm = safe_float(merged.get("eps_ttm"))
     merged["pb_now"] = safe_div(current_price, bps)
     merged["pe_now"] = safe_div(current_price, eps_ttm)
 
-    # ensure defaults
     defaults = {
         "growth_floor": 0.0,
         "growth_cap": 0.15,
@@ -742,6 +729,7 @@ def merge_db(existing_db: Dict[str, Any], fresh: Dict[str, Any], refresh_full: b
     return merged
 
 
+# 既存ロジックは流用可能箇所として残すが、新表示列の算出では使用しない
 def compute_nonfinancial_fair_price(db: Dict[str, Any]) -> Tuple[Optional[float], Optional[float], Optional[float], Optional[float], List[str]]:
     notes: List[str] = []
     roic = safe_float(db.get("roic_normalized"))
@@ -844,7 +832,7 @@ def compute_nonfinancial_fair_price(db: Dict[str, Any]) -> Tuple[Optional[float]
     return ep_price, vdf_price, implied_growth, implied_gap_years, notes
 
 
-def compute_financial_fair_price(db: Dict[str, Any]) -> Tuple[Optional[float], Optional[float], Optional[float], Optional[float], str, List[str]]:
+def compute_financial_fair_price(db: Dict[str, Any]) -> Tuple[Optional[float], Optional[float], Optional[float], Optional[float], Optional[float], Optional[float], str, List[str]]:
     notes: List[str] = []
     current_price = safe_float(db.get("current_price"))
     bps = safe_float(db.get("bps"))
@@ -907,7 +895,7 @@ def compute_financial_fair_price(db: Dict[str, Any]) -> Tuple[Optional[float], O
     return coe, roe, spread, justified_pbr, fair_price, implied_roe, judgement, notes
 
 
-def compute_nonfinancial_conservative_price(db: Dict[str, Any]) -> Optional[float]:
+def compute_decay_ep_price(db: Dict[str, Any]) -> Optional[float]:
     roic_normalized = safe_float(db.get("roic_normalized"))
     roic_1y = safe_float(db.get("roic_1y"))
     wacc = safe_float(db.get("wacc"))
@@ -918,35 +906,37 @@ def compute_nonfinancial_conservative_price(db: Dict[str, Any]) -> Optional[floa
     growth_base = safe_float(db.get("growth_base"))
 
     roic_candidates = [v for v in [roic_normalized, roic_1y] if v is not None]
-    if not roic_candidates:
+    if not roic_candidates or invested_capital in (None, 0) or shares in (None, 0):
         return None
-    roic_cons = min(roic_candidates)
+    roic_use = min(roic_candidates)
 
     discount_candidates = [v for v in [
-        (wacc + 0.015) if wacc is not None else None,
-        coe
+        wacc,
+        (coe - 0.01) if coe is not None else None,
+        0.07,
     ] if v is not None]
-    if not discount_candidates or invested_capital is None or shares in (None, 0):
+    if not discount_candidates:
         return None
-    discount_cons = max(discount_candidates)
+    discount_use = max(discount_candidates)
 
-    g_candidates = [v for v in [
+    growth_candidates = [v for v in [
         growth_base,
-        0.03,
-        discount_cons - 0.03,
+        0.04,
+        discount_use - 0.03,
     ] if v is not None]
-    if not g_candidates:
+    if not growth_candidates:
         return None
-    g_cons = clip(min(g_candidates), 0.0, 0.03)
+    growth_use = clip(min(growth_candidates), 0.0, 0.04)
 
     ev = invested_capital
     ic = invested_capital
-    base_spread = roic_cons - discount_cons
+    base_spread = roic_use - discount_use
+
     for year in range(1, 6):
-        ic = ic * (1 + (g_cons or 0.0))
-        spread_t = base_spread * ((6 - year) / 5)
-        ep = spread_t * ic
-        ev += ep / ((1 + discount_cons) ** year)
+        ic = ic * (1 + (growth_use or 0.0))
+        decay_factor = (6 - year) / 5
+        ep = base_spread * decay_factor * ic
+        ev += ep / ((1 + discount_use) ** year)
 
     equity_value = ev - net_debt
     if equity_value <= 0:
@@ -954,7 +944,35 @@ def compute_nonfinancial_conservative_price(db: Dict[str, Any]) -> Optional[floa
     return safe_div(equity_value, shares)
 
 
-def compute_financial_conservative_price(db: Dict[str, Any]) -> Optional[float]:
+def compute_profit_anchor_price(db: Dict[str, Any]) -> Optional[float]:
+    eps_ttm = safe_float(db.get("eps_ttm"))
+    roic_normalized = safe_float(db.get("roic_normalized"))
+    wacc = safe_float(db.get("wacc"))
+    if eps_ttm is None or roic_normalized is None or wacc is None:
+        return None
+    spread = max(roic_normalized - wacc, 0.0)
+    pe_target = clip(10 + 40 * spread, 8, 18)
+    price = eps_ttm * pe_target
+    if price <= 0:
+        return None
+    return price
+
+
+def compute_asset_anchor_price(db: Dict[str, Any]) -> Optional[float]:
+    bps = safe_float(db.get("bps"))
+    roic_normalized = safe_float(db.get("roic_normalized"))
+    wacc = safe_float(db.get("wacc"))
+    if bps is None or roic_normalized is None or wacc is None:
+        return None
+    spread = max(roic_normalized - wacc, 0.0)
+    pb_target = clip(0.8 + 8 * spread, 0.8, 2.5)
+    price = bps * pb_target
+    if price <= 0:
+        return None
+    return price
+
+
+def compute_conservative_pbr_price(db: Dict[str, Any]) -> Optional[float]:
     roe_normalized = safe_float(db.get("roe_normalized"))
     roe_1y = safe_float(db.get("roe_1y"))
     coe = safe_float(db.get("coe"))
@@ -962,40 +980,87 @@ def compute_financial_conservative_price(db: Dict[str, Any]) -> Optional[float]:
     payout_ratio = safe_float(db.get("payout_ratio"))
 
     roe_candidates = [v for v in [roe_normalized, roe_1y] if v is not None]
-    if not roe_candidates or bps is None:
+    if not roe_candidates or bps is None or coe is None or payout_ratio is None:
         return None
-    roe_cons = min(roe_candidates)
-
-    coe_candidates = [v for v in [
-        (coe + 0.015) if coe is not None else None,
-        0.08,
-    ] if v is not None]
-    if not coe_candidates:
+    if payout_ratio < 0:
         return None
-    coe_cons = max(coe_candidates)
+    payout_use = min(payout_ratio, 1.0)
+    roe_use = min(roe_candidates)
+    coe_use = max(coe, 0.08)
 
-    payout_cons = payout_ratio
-    if payout_cons is not None and payout_cons < 0:
-        payout_cons = None
-    if payout_cons is not None and payout_cons > 1.0:
-        payout_cons = 1.0
-
-    retained_growth = roe_cons * (1 - (payout_cons if payout_cons is not None else 0.5))
-    g_candidates = [v for v in [retained_growth, 0.02, coe_cons - 0.02] if v is not None]
+    retained_growth = roe_use * (1 - payout_use)
+    g_candidates = [v for v in [retained_growth, 0.02, coe_use - 0.02] if v is not None]
     if not g_candidates:
         return None
-    g_cons = clip(min(g_candidates), 0.0, 0.02)
+    g_use = clip(min(g_candidates), 0.0, 0.02)
+    if coe_use <= g_use:
+        return None
 
-    if coe_cons <= g_cons:
+    pbr_raw = safe_div((roe_use - g_use), (coe_use - g_use))
+    if pbr_raw is None or pbr_raw < 0:
         return None
-    justified_pbr_cons = safe_div((roe_cons - g_cons), (coe_cons - g_cons))
-    if justified_pbr_cons is None or justified_pbr_cons < 0:
+    pbr_target = clip(pbr_raw, 0.6, 2.2)
+    price = bps * pbr_target
+    if price <= 0:
         return None
-    return bps * justified_pbr_cons
+    return price
+
+
+def compute_dividend_discount_price(db: Dict[str, Any]) -> Optional[float]:
+    dps_ttm = safe_float(db.get("dps_ttm"))
+    coe = safe_float(db.get("coe"))
+    payout_ratio = safe_float(db.get("payout_ratio"))
+    roe_normalized = safe_float(db.get("roe_normalized"))
+
+    if dps_ttm is None or coe is None or payout_ratio is None or roe_normalized is None:
+        return None
+    if payout_ratio < 0:
+        return None
+    payout_use = min(payout_ratio, 1.0)
+    coe_use = max(coe, 0.08)
+    retained_growth = roe_normalized * (1 - payout_use)
+    g_candidates = [v for v in [retained_growth, 0.015, coe_use - 0.02] if v is not None]
+    if not g_candidates:
+        return None
+    g_div = clip(min(g_candidates), 0.0, 0.015)
+    if coe_use <= g_div:
+        return None
+
+    price = safe_div(dps_ttm, (coe_use - g_div))
+    if price is None or price <= 0:
+        return None
+    return price
+
+
+def compute_financial_profit_anchor_price(db: Dict[str, Any]) -> Optional[float]:
+    eps_ttm = safe_float(db.get("eps_ttm"))
+    roe_normalized = safe_float(db.get("roe_normalized"))
+    coe = safe_float(db.get("coe"))
+    if eps_ttm is None or roe_normalized is None or coe is None:
+        return None
+    spread = max(roe_normalized - coe, 0.0)
+    pe_target = clip(7 + 35 * spread, 6, 12)
+    price = eps_ttm * pe_target
+    if price <= 0:
+        return None
+    return price
+
+
+def compute_model_confidence(candidate_prices: List[Optional[float]]) -> str:
+    vals = [v for v in candidate_prices if v is not None and v > 0]
+    if not vals:
+        return ""
+    if len(vals) == 1:
+        return "低"
+    ratio = max(vals) / min(vals)
+    if len(vals) == 3 and ratio <= 1.8:
+        return "高"
+    if len(vals) == 2 or (len(vals) == 3 and ratio <= 2.5):
+        return "中"
+    return "低"
 
 
 def compute_outputs(db: Dict[str, Any]) -> Dict[str, Any]:
-    notes: List[str] = []
     current_price = safe_float(db.get("current_price"))
     override = str(db.get("financial_flag_override") or "").strip()
     auto_financial_flag = safe_int(db.get("financial_flag")) or 0
@@ -1004,116 +1069,78 @@ def compute_outputs(db: Dict[str, Any]) -> Dict[str, Any]:
     else:
         financial_flag = auto_financial_flag
 
-    ep_price, vdf_price, implied_growth, implied_gap_years, nf_notes = compute_nonfinancial_fair_price(db)
-    notes.extend(nf_notes)
-
-    coe, fin_roe, fin_spread, justified_pbr, fin_fair_price, fin_implied_roe, fin_judgement, fin_notes = compute_financial_fair_price(db)
-    notes.extend(fin_notes)
+    decay_ep_price = None
+    profit_anchor_price = None
+    asset_anchor_price = None
+    conservative_pbr_price = None
+    dividend_discount_price = None
+    financial_profit_anchor_price = None
 
     if financial_flag == 1:
-        integrated_price = fin_fair_price
-        diff_rate = safe_div((current_price - integrated_price), integrated_price) if current_price is not None and integrated_price else None
-        overall_judgement = fin_judgement
+        conservative_pbr_price = compute_conservative_pbr_price(db)
+        dividend_discount_price = compute_dividend_discount_price(db)
+        financial_profit_anchor_price = compute_financial_profit_anchor_price(db)
+        candidate_prices = [conservative_pbr_price, dividend_discount_price, financial_profit_anchor_price]
     else:
-        integrated_price = median_or_single([ep_price, vdf_price])
-        diff_rate = safe_div((current_price - integrated_price), integrated_price) if current_price is not None and integrated_price else None
-        spread = safe_float(db.get("roic_normalized"))
-        wacc = safe_float(db.get("wacc"))
-        roic_wacc_spread = spread - wacc if spread is not None and wacc is not None else None
-        if integrated_price is None:
-            overall_judgement = "算出不能"
-        elif roic_wacc_spread is None or roic_wacc_spread <= 0:
+        decay_ep_price = compute_decay_ep_price(db)
+        profit_anchor_price = compute_profit_anchor_price(db)
+        asset_anchor_price = compute_asset_anchor_price(db)
+        candidate_prices = [decay_ep_price, profit_anchor_price, asset_anchor_price]
+
+    fair_price = median_or_single(candidate_prices)
+    buy_limit_price = None
+    if fair_price is not None:
+        buy_limit_price = fair_price * (0.85 if financial_flag == 1 else 0.80)
+
+    diff_rate = safe_div((current_price - fair_price), fair_price) if current_price is not None and fair_price else None
+    buy_limit_diff_rate = safe_div((current_price - buy_limit_price), buy_limit_price) if current_price is not None and buy_limit_price else None
+    confidence = compute_model_confidence(candidate_prices)
+
+    roe_normalized = safe_float(db.get("roe_normalized"))
+    coe = safe_float(db.get("coe"))
+    roic_normalized = safe_float(db.get("roic_normalized"))
+    wacc = safe_float(db.get("wacc"))
+
+    if fair_price is None or current_price is None:
+        overall_judgement = "算出不能"
+    elif financial_flag == 1:
+        if roe_normalized is None or coe is None or roe_normalized <= coe:
             overall_judgement = "改善待ち"
-        elif diff_rate is not None and diff_rate <= -0.20 and (implied_growth is None or implied_growth < 0.15) and (implied_gap_years is None or implied_gap_years < 20):
+        elif buy_limit_price is not None and current_price <= buy_limit_price and confidence != "低":
             overall_judgement = "割安候補"
-        elif diff_rate is not None and -0.20 < diff_rate < 0.20:
+        elif current_price <= fair_price:
+            overall_judgement = "妥当"
+        else:
+            overall_judgement = "期待先行"
+    else:
+        if roic_normalized is None or wacc is None or roic_normalized <= wacc:
+            overall_judgement = "改善待ち"
+        elif buy_limit_price is not None and current_price <= buy_limit_price and confidence != "低":
+            overall_judgement = "割安候補"
+        elif current_price <= fair_price:
             overall_judgement = "妥当"
         else:
             overall_judgement = "期待先行"
 
-    ef_divergence = None
-    if ep_price is not None and vdf_price is not None and (ep_price + vdf_price) != 0:
-        ef_divergence = abs(ep_price - vdf_price) / ((ep_price + vdf_price) / 2)
-        if ef_divergence > 0.20:
-            with_note(notes, "E/F乖離率が20%超。成長段階企業か前提値ズレの可能性。")
-
-    roic_wacc_spread = None
-    if safe_float(db.get("roic_normalized")) is not None and safe_float(db.get("wacc")) is not None:
-        roic_wacc_spread = safe_float(db.get("roic_normalized")) - safe_float(db.get("wacc"))
-
-    conservative_price_raw = None
-    if financial_flag == 1:
-        conservative_price_raw = compute_financial_conservative_price(db)
-    else:
-        conservative_price_raw = compute_nonfinancial_conservative_price(db)
-
-    if integrated_price is not None and conservative_price_raw is not None:
-        conservative_price = min(conservative_price_raw, integrated_price)
-    else:
-        conservative_price = conservative_price_raw or integrated_price
-
-    conservative_diff_rate = safe_div((current_price - conservative_price), conservative_price) if current_price is not None and conservative_price else None
-
-    if financial_flag == 1:
-        if conservative_price is None:
-            conservative_judgement = "算出不能"
-        elif fin_spread is None or fin_spread <= 0:
-            conservative_judgement = "改善待ち"
-        elif conservative_diff_rate is not None and conservative_diff_rate <= -0.20 and fin_implied_roe is not None and fin_roe is not None and fin_implied_roe <= fin_roe + 0.03:
-            conservative_judgement = "割安候補"
-        elif conservative_diff_rate is not None and -0.20 < conservative_diff_rate < 0.15:
-            conservative_judgement = "妥当"
-        else:
-            conservative_judgement = "期待先行"
-    else:
-        if conservative_price is None:
-            conservative_judgement = "算出不能"
-        elif roic_wacc_spread is None or roic_wacc_spread <= 0:
-            conservative_judgement = "改善待ち"
-        elif conservative_diff_rate is not None and conservative_diff_rate <= -0.25 and (implied_growth is None or implied_growth < 0.10) and (implied_gap_years is None or implied_gap_years < 10):
-            conservative_judgement = "割安候補"
-        elif conservative_diff_rate is not None and -0.25 < conservative_diff_rate < 0.15:
-            conservative_judgement = "妥当"
-        else:
-            conservative_judgement = "期待先行"
-
-    db["implied_growth_rate"] = implied_growth
-    db["implied_gap_years"] = implied_gap_years
-    db["financial_roe_avg"] = fin_roe
-    db["financial_payout_avg"] = safe_float(db.get("payout_ratio"))
-    db["financial_justified_pbr"] = justified_pbr
-    db["financial_implied_roe"] = fin_implied_roe
-    existing_notes = str(db.get("notes") or "").strip()
-    joined = " | ".join([n for n in [existing_notes] + notes if n])
-    db["notes"] = joined
-
     return {
-        "Economic Profit 株価": ep_price,
-        "Value Driver Formula 株価": vdf_price,
-        "Reverse DCF 市場織込成長率": implied_growth,
-        "Reverse DCF GAP 年数": implied_gap_years,
-        "ROIC-WACC スプレッド": roic_wacc_spread,
-        "統合適正株価": integrated_price,
+        "適正株価": fair_price,
+        "買い上限株価": buy_limit_price,
         "現在株価との差異率": diff_rate,
+        "買い上限との差異率": buy_limit_diff_rate,
         "総合判定": overall_judgement,
+        "減衰EP株価": decay_ep_price,
+        "利益アンカー株価": profit_anchor_price,
+        "純資産アンカー株価": asset_anchor_price,
+        "保守PBR株価": conservative_pbr_price,
+        "配当割引株価": dividend_discount_price,
+        "金融利益アンカー株価": financial_profit_anchor_price,
         "金融業種フラグ": financial_flag,
-        "金融_CoE": coe,
-        "金融_平準化ROE": fin_roe,
-        "金融_ROE-CoEスプレッド": fin_spread,
-        "金融_正当PBR": justified_pbr,
-        "金融_適正株価": fin_fair_price,
-        "金融_市場織込ROE": fin_implied_roe,
-        "金融_判定": fin_judgement,
-        "E/F 乖離率": ef_divergence,
-        "保守適正株価": conservative_price,
-        "現在株価との差異率（保守）": conservative_diff_rate,
-        "保守判定": conservative_judgement,
+        "モデル信頼度": confidence,
     }
 
 
 def ensure_headers(ws: gspread.Worksheet) -> Tuple[Dict[str, int], Dict[str, int]]:
-    # E1:X1
-    ws.update("E1:X1", [EVAL_HEADERS], value_input_option="USER_ENTERED")
+    ws.update("E1:Q1", [EVAL_HEADERS], value_input_option="USER_ENTERED")
     db_start_col = 27  # AA
     db_end_col = db_start_col + len(DB_HEADERS) - 1
     db_range = f"AA1:{column_letter(db_end_col)}1"
@@ -1155,7 +1182,7 @@ def main() -> None:
     spreadsheet = gc.open_by_url(config["spreadsheet_url"])
     ws = spreadsheet.worksheet(config["sheet_name"])
 
-    eval_positions, db_positions = ensure_headers(ws)
+    ensure_headers(ws)
     header_row = ws.row_values(1)
 
     input_rows = ws.get("A2:D")
@@ -1187,7 +1214,6 @@ def main() -> None:
         try:
             fresh = fetch_ticker_data(ticker, refresh_full=refresh_full)
             if not refresh_full:
-                # lightweight refresh keeps previous full DB
                 fresh["last_db_update_jst"] = existing_db.get("last_db_update_jst")
                 if not fresh.get("financial_flag"):
                     fresh["financial_flag"] = existing_db.get("financial_flag")
@@ -1211,8 +1237,6 @@ def main() -> None:
             db["calc_error"] = str(exc)
             outputs = {key: "" for key in EVAL_HEADERS}
             outputs["総合判定"] = "算出不能"
-            outputs["金融_判定"] = "算出不能"
-            outputs["保守判定"] = "算出不能"
 
         output_matrix.append([serialize_cell(outputs.get(h)) for h in EVAL_HEADERS])
         db_matrix.append([serialize_cell(db.get(h)) for h in DB_HEADERS])
