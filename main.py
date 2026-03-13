@@ -1396,12 +1396,23 @@ def compute_outputs(db: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-def ensure_headers(ws: gspread.Worksheet) -> Tuple[Dict[str, int], Dict[str, int]]:
+def should_fetch_db_for_this_run() -> bool:
+    event_name = os.environ.get("GITHUB_EVENT_NAME", "")
+    if event_name == "schedule":
+        return False
+    if event_name == "workflow_dispatch":
+        return True
+    return True
+
+
+
+def ensure_headers(ws: gspread.Worksheet, include_db_headers: bool = True) -> Tuple[Dict[str, int], Dict[str, int]]:
     ws.update("E1:Q1", [EVAL_HEADERS], value_input_option="USER_ENTERED")
-    db_start_col = 27  # AA
-    db_end_col = db_start_col + len(DB_HEADERS) - 1
-    db_range = f"AA1:{column_letter(db_end_col)}1"
-    ws.update(db_range, [DB_HEADERS], value_input_option="USER_ENTERED")
+    if include_db_headers:
+        db_start_col = 27  # AA
+        db_end_col = db_start_col + len(DB_HEADERS) - 1
+        db_range = f"AA1:{column_letter(db_end_col)}1"
+        ws.update(db_range, [DB_HEADERS], value_input_option="USER_ENTERED")
 
     header_row = ws.row_values(1)
     header_map = {name: idx + 1 for idx, name in enumerate(header_row) if name}
@@ -1439,7 +1450,8 @@ def main() -> None:
     spreadsheet = gc.open_by_url(config["spreadsheet_url"])
     ws = spreadsheet.worksheet(config["sheet_name"])
 
-    ensure_headers(ws)
+    fetch_db_for_this_run = should_fetch_db_for_this_run()
+    ensure_headers(ws, include_db_headers=fetch_db_for_this_run)
     header_row = ws.row_values(1)
 
     input_rows = ws.get("A2:D")
@@ -1453,7 +1465,7 @@ def main() -> None:
     output_matrix: List[List[Any]] = []
     db_matrix: List[List[Any]] = []
 
-    force_db_refresh = bool(config.get("force_db_refresh", False))
+    force_db_refresh = bool(config.get("force_db_refresh", False)) and fetch_db_for_this_run
 
     for row_idx, row in enumerate(input_rows, start=2):
         full_row = existing_full_rows[row_idx - 2] if row_idx - 2 < len(existing_full_rows) else []
@@ -1462,11 +1474,12 @@ def main() -> None:
         code = str(row[0]).strip() if len(row) >= 1 else ""
         if not code:
             output_matrix.append([""] * len(EVAL_HEADERS))
-            db_matrix.append([""] * len(DB_HEADERS))
+            if fetch_db_for_this_run:
+                db_matrix.append([""] * len(DB_HEADERS))
             continue
 
         ticker = normalize_code(code)
-        refresh_full = should_refresh_db(existing_db, force=force_db_refresh)
+        refresh_full = fetch_db_for_this_run and should_refresh_db(existing_db, force=force_db_refresh)
 
         try:
             fresh = fetch_ticker_data(ticker, refresh_full=refresh_full, config=config)
@@ -1496,7 +1509,8 @@ def main() -> None:
             outputs["総合判定"] = "算出不能"
 
         output_matrix.append([serialize_cell(outputs.get(h)) for h in EVAL_HEADERS])
-        db_matrix.append([serialize_cell(db.get(h)) for h in DB_HEADERS])
+        if fetch_db_for_this_run:
+            db_matrix.append([serialize_cell(db.get(h)) for h in DB_HEADERS])
 
     eval_end_col = column_letter(5 + len(EVAL_HEADERS) - 1)  # E
     ws.update(
@@ -1505,12 +1519,13 @@ def main() -> None:
         value_input_option="USER_ENTERED",
     )
 
-    db_end_col = column_letter(27 + len(DB_HEADERS) - 1)  # AA
-    ws.update(
-        f"AA2:{db_end_col}{last_row}",
-        db_matrix,
-        value_input_option="USER_ENTERED",
-    )
+    if fetch_db_for_this_run:
+        db_end_col = column_letter(27 + len(DB_HEADERS) - 1)  # AA
+        ws.update(
+            f"AA2:{db_end_col}{last_row}",
+            db_matrix,
+            value_input_option="USER_ENTERED",
+        )
 
 
 if __name__ == "__main__":
