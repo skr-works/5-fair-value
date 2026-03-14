@@ -25,14 +25,7 @@ SHEET_SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
     "https://www.googleapis.com/auth/drive",
 ]
-SBI_JP10Y_URL = "https://www.sbisec.co.jp/ETGate/?_ControlID=WPLETmgR001Control&_PageID=WPLETmgR001Mdtl20&_DataStoreID=DSWPLETmgR001Control&_ActionID=DefaultAID&burl=iris_indexDetail&cat1=market&cat2=index&dir=tl1-idxdtl%7Ctl2-JP10YT%3DXX%7Ctl5-jpn&file=index.html&getFlg=on"
-SBI_USER_AGENTS = [
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:135.0) Gecko/20100101 Firefox/135.0",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_3) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.3 Safari/605.1.15",
-]
+MOF_JGB_CSV_URL = "https://www.mof.go.jp/jgbs/reference/interest_rate/jgbcm.csv"
 _RF_RATE_CACHE: Optional[float] = None
 _RF_RATE_SOURCE = ""
 
@@ -165,6 +158,8 @@ def error_guidance_message(exc: Exception) -> str:
     msg = str(exc)
     lower_msg = msg.lower()
 
+    if "rf_rate取得失敗" in msg:
+        return "修正方針: 財務省CSV（jgbcm.csv）の取得可否、列名（基準日・10年）、文字コード（shift-jis）を確認してください。"
     if "grid limits" in lower_msg or "max columns" in lower_msg or "max rows" in lower_msg:
         return "修正方針: スプレッドシートの行数・列数が不足しています。対象シートのグリッドを拡張してください。"
     if "permission" in lower_msg or "forbidden" in lower_msg or "403" in lower_msg:
@@ -495,87 +490,68 @@ def get_info_value(info: Dict[str, Any], keys: List[str]) -> Any:
     return None
 
 
-def _extract_percent_from_text(text: str) -> Optional[float]:
-    patterns = [
-        r"JP10YT=XX.{0,300}?(-?\d+(?:\.\d+)?)\s*%",
-        r"(?:日本\s*10年|日本10年|10年国債|長期金利).{0,200}?(-?\d+(?:\.\d+)?)\s*%",
-    ]
-    for pattern in patterns:
-        m = re.search(pattern, text, flags=re.IGNORECASE | re.DOTALL)
-        if m:
-            value = safe_float(m.group(1))
-            if value is not None:
-                rate = value / 100.0
-                if 0.0 <= rate <= 0.10:
-                    return rate
-    return None
+def parse_japanese_era_date(text: Any) -> Optional[pd.Timestamp]:
+    if text is None:
+        return None
+    s = str(text).strip()
+    if not s:
+        return None
+
+    m = re.match(r"^R\s*(\d+)[\./-](\d{1,2})[\./-](\d{1,2})$", s, flags=re.IGNORECASE)
+    if not m:
+        return None
+
+    try:
+        year = 2018 + int(m.group(1))
+        month = int(m.group(2))
+        day = int(m.group(3))
+        return pd.Timestamp(year=year, month=month, day=day)
+    except Exception:
+        return None
 
 
-def fetch_rf_rate_japan_from_sbi() -> float:
+def fetch_rf_rate_japan_from_mof() -> float:
     global _RF_RATE_CACHE, _RF_RATE_SOURCE
     if _RF_RATE_CACHE is not None:
         return _RF_RATE_CACHE
 
-    for attempt in range(3):
-        headers = {
-            "User-Agent": random.choice(SBI_USER_AGENTS),
-            "Accept-Language": "ja,en-US;q=0.9,en;q=0.8",
-            "Cache-Control": "no-cache",
-            "Pragma": "no-cache",
-        }
-        try:
-            response = requests.get(SBI_JP10Y_URL, headers=headers, timeout=10)
-            response.raise_for_status()
-            response.encoding = response.apparent_encoding or response.encoding
-            html = response.text
+    try:
+        df = pd.read_csv(MOF_JGB_CSV_URL, skiprows=1, encoding="shift-jis")
+    except Exception as exc:
+        raise RuntimeError(f"rf_rate取得失敗: 財務省CSVの取得に失敗: {exc}") from exc
 
-            rate = _extract_percent_from_text(html)
-            if rate is None:
-                try:
-                    tables = pd.read_html(StringIO(html))
-                except Exception:
-                    tables = []
-                for table in tables:
-                    for _, row in table.astype(str).iterrows():
-                        row_text = " ".join(row.tolist())
-                        if any(label in row_text for label in ["JP10YT=XX", "日本 10年", "日本10年", "10年国債", "長期金利"]):
-                            match = re.search(r"(-?\d+(?:\.\d+)?)\s*%", row_text)
-                            if match:
-                                value = safe_float(match.group(1))
-                                if value is not None:
-                                    candidate = value / 100.0
-                                    if 0.0 <= candidate <= 0.10:
-                                        rate = candidate
-                                        break
-                    if rate is not None:
-                        break
-            if rate is None:
-                for label in ["日本 10年", "日本10年", "10年国債", "長期金利"]:
-                    match = re.search(label + r".{0,200}?(-?\d+(?:\.\d+)?)\s*%", html, flags=re.IGNORECASE | re.DOTALL)
-                    if match:
-                        value = safe_float(match.group(1))
-                        if value is not None:
-                            candidate = value / 100.0
-                            if 0.0 <= candidate <= 0.10:
-                                rate = candidate
-                                break
+    df.columns = [str(col).strip() for col in df.columns]
 
-            if rate is not None:
-                _RF_RATE_CACHE = rate
-                _RF_RATE_SOURCE = "SBI"
-                return rate
-        except Exception:
-            pass
+    if "基準日" not in df.columns:
+        raise RuntimeError("rf_rate取得失敗: 財務省CSVに 基準日 列が存在しない")
+    if "10年" not in df.columns:
+        raise RuntimeError("rf_rate取得失敗: 財務省CSVに 10年 列が存在しない")
 
-        if attempt < 2:
-            time.sleep(2 ** attempt)
+    work = df[["基準日", "10年"]].copy()
+    work["基準日_parsed"] = work["基準日"].apply(parse_japanese_era_date)
+    work["10年_numeric"] = pd.to_numeric(work["10年"], errors="coerce")
+    work = work.dropna(subset=["基準日_parsed", "10年_numeric"])
 
-    _RF_RATE_CACHE = 0.015
-    _RF_RATE_SOURCE = "FALLBACK"
-    return _RF_RATE_CACHE
+    if work.empty:
+        raise RuntimeError("rf_rate取得失敗: 有効な基準日・10年利回り行が存在しない")
+
+    work = work.sort_values("基準日_parsed")
+    latest = work.iloc[-1]
+    rate_percent = safe_float(latest["10年_numeric"])
+
+    if rate_percent is None:
+        raise RuntimeError("rf_rate取得失敗: 最新行の10年利回りが数値化できない")
+
+    rf_rate = rate_percent / 100.0
+    if not (0.0 <= rf_rate <= 0.10):
+        raise RuntimeError(f"rf_rate取得失敗: 10年利回りの値が想定範囲外: {rate_percent}")
+
+    _RF_RATE_CACHE = rf_rate
+    _RF_RATE_SOURCE = "MOF"
+    return rf_rate
 
 
-def fetch_ticker_data(ticker: str, refresh_full: bool, config: Dict[str, Any]) -> Dict[str, Any]:
+def fetch_ticker_data(ticker: str, refresh_full: bool, config: Dict[str, Any], rf_rate: Optional[float] = None) -> Dict[str, Any]:
     tk = yf.Ticker(ticker)
 
     info: Dict[str, Any] = {}
@@ -751,11 +727,9 @@ def fetch_ticker_data(ticker: str, refresh_full: bool, config: Dict[str, Any]) -
         if raw_beta is None:
             with_note(notes, "βは2年週次推定を優先し、取得不能時はinfoのbeta→1.0で代替。業種平均フォールバックは未実装。")
 
-        rf_rate = fetch_rf_rate_japan_from_sbi()
-        if _RF_RATE_SOURCE == "SBI":
-            with_note(notes, "rf_rateはSBIの日本10年国債利回りを使用")
-        else:
-            with_note(notes, "rf_rateはSBI取得失敗のため固定値0.015を使用")
+        if rf_rate is None:
+            raise RuntimeError("rf_rate未設定: 財務省CSVの取得結果を渡してください")
+        with_note(notes, "rf_rateは財務省CSVの10年国債利回りを使用")
         erp = get_optional_config_rate(config, "erp_override", 0.055)
         country_risk_premium = get_optional_config_rate(config, "country_risk_premium_override", 0.0)
         size_premium = market_cap_size_premium(market_cap)
@@ -1405,7 +1379,6 @@ def should_fetch_db_for_this_run() -> bool:
     return True
 
 
-
 def ensure_headers(ws: gspread.Worksheet, include_db_headers: bool = True) -> Tuple[Dict[str, int], Dict[str, int]]:
     ws.update("E1:Q1", [EVAL_HEADERS], value_input_option="USER_ENTERED")
     if include_db_headers:
@@ -1467,6 +1440,15 @@ def main() -> None:
 
     force_db_refresh = bool(config.get("force_db_refresh", False)) and fetch_db_for_this_run
 
+    rf_rate: Optional[float] = None
+    if fetch_db_for_this_run:
+        try:
+            rf_rate = fetch_rf_rate_japan_from_mof()
+        except Exception as exc:
+            logger.error("ERROR: %s", exc)
+            logger.error(error_guidance_message(exc))
+            raise
+
     for row_idx, row in enumerate(input_rows, start=2):
         full_row = existing_full_rows[row_idx - 2] if row_idx - 2 < len(existing_full_rows) else []
         existing_db = row_to_db_dict(header_row, full_row)
@@ -1482,7 +1464,7 @@ def main() -> None:
         refresh_full = fetch_db_for_this_run and should_refresh_db(existing_db, force=force_db_refresh)
 
         try:
-            fresh = fetch_ticker_data(ticker, refresh_full=refresh_full, config=config)
+            fresh = fetch_ticker_data(ticker, refresh_full=refresh_full, config=config, rf_rate=rf_rate)
             if not refresh_full:
                 fresh["last_db_update_jst"] = existing_db.get("last_db_update_jst")
                 if not fresh.get("financial_flag"):
