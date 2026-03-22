@@ -30,19 +30,20 @@ _RF_RATE_CACHE: Optional[float] = None
 _RF_RATE_SOURCE = ""
 
 EVAL_HEADERS = [
-    "適正株価",                # E
-    "買い上限株価",            # F
-    "現在株価との差異率",      # G
-    "買い上限との差異率",      # H
-    "総合判定",                # I
-    "減衰EP株価",              # J
-    "利益アンカー株価",        # K
-    "純資産アンカー株価",      # L
-    "保守PBR株価",             # M
-    "配当割引株価",            # N
-    "金融利益アンカー株価",    # O
-    "金融業種フラグ",          # P
-    "モデル信頼度",            # Q
+    "現在株価",                # E
+    "適正株価",                # F
+    "買い上限株価",            # G
+    "現在株価との差異率",      # H
+    "買い上限との差異率",      # I
+    "総合判定",                # J
+    "減衰EP株価",              # K
+    "利益アンカー株価",        # L
+    "純資産アンカー株価",      # M
+    "保守PBR株価",             # N
+    "配当割引株価",            # O
+    "金融利益アンカー株価",    # P
+    "金融業種フラグ",          # Q
+    "モデル信頼度",            # R
 ]
 
 DB_HEADERS = [
@@ -1354,6 +1355,7 @@ def compute_outputs(db: Dict[str, Any]) -> Dict[str, Any]:
         overall_judgement = "かなり割高"
 
     return {
+        "現在株価": current_price,
         "適正株価": fair_price,
         "買い上限株価": buy_limit_price,
         "現在株価との差異率": diff_rate,
@@ -1380,7 +1382,7 @@ def should_fetch_db_for_this_run() -> bool:
 
 
 def ensure_headers(ws: gspread.Worksheet, include_db_headers: bool = True) -> Tuple[Dict[str, int], Dict[str, int]]:
-    ws.update("E1:Q1", [EVAL_HEADERS], value_input_option="USER_ENTERED")
+    ws.update("E1:R1", [EVAL_HEADERS], value_input_option="USER_ENTERED")
     if include_db_headers:
         db_start_col = 27  # AA
         db_end_col = db_start_col + len(DB_HEADERS) - 1
