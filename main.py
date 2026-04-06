@@ -1463,7 +1463,17 @@ def main() -> None:
             continue
 
         ticker = normalize_code(code)
-        refresh_full = fetch_db_for_this_run and should_refresh_db(existing_db, force=force_db_refresh)
+
+        existing_ticker_raw = str(existing_db.get("ticker_yf") or "").strip()
+        existing_ticker = normalize_code(existing_ticker_raw) if existing_ticker_raw else ""
+        ticker_changed = fetch_db_for_this_run and bool(existing_ticker) and existing_ticker != ticker
+
+        refresh_full = fetch_db_for_this_run and (
+            ticker_changed or should_refresh_db(existing_db, force=force_db_refresh)
+        )
+
+        db_base = {key: "" for key in DB_HEADERS} if ticker_changed else existing_db
+        db_base["financial_flag_override"] = existing_db.get("financial_flag_override", "")
 
         try:
             fresh = fetch_ticker_data(ticker, refresh_full=refresh_full, config=config, rf_rate=rf_rate)
@@ -1475,7 +1485,8 @@ def main() -> None:
                     fresh["missing_fields"] = existing_db.get("missing_fields", "")
                 if not fresh.get("notes"):
                     fresh["notes"] = existing_db.get("notes", "")
-            db = merge_db(existing_db, fresh, refresh_full=refresh_full)
+
+            db = merge_db(db_base, fresh, refresh_full=refresh_full)
 
             if db.get("ticker_yf") in (None, ""):
                 db["ticker_yf"] = ticker
@@ -1485,7 +1496,13 @@ def main() -> None:
             outputs = compute_outputs(db)
         except Exception as exc:
             log_error_with_guidance(exc)
-            db = {key: existing_db.get(key, "") for key in DB_HEADERS}
+
+            if ticker_changed:
+                db = {key: "" for key in DB_HEADERS}
+                db["financial_flag_override"] = existing_db.get("financial_flag_override", "")
+            else:
+                db = {key: existing_db.get(key, "") for key in DB_HEADERS}
+
             db["ticker_yf"] = ticker
             db["data_status"] = "ERROR"
             db["calc_error"] = str(exc)
