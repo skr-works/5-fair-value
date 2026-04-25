@@ -1382,12 +1382,20 @@ def should_fetch_db_for_this_run() -> bool:
 
 
 def ensure_headers(ws: gspread.Worksheet, include_db_headers: bool = True) -> Tuple[Dict[str, int], Dict[str, int]]:
-    ws.update("E1:R1", [EVAL_HEADERS], value_input_option="USER_ENTERED")
+    ws.update(
+        values=[EVAL_HEADERS],
+        range_name="E1:R1",
+        value_input_option="USER_ENTERED",
+    )
     if include_db_headers:
         db_start_col = 27  # AA
         db_end_col = db_start_col + len(DB_HEADERS) - 1
         db_range = f"AA1:{column_letter(db_end_col)}1"
-        ws.update(db_range, [DB_HEADERS], value_input_option="USER_ENTERED")
+        ws.update(
+            values=[DB_HEADERS],
+            range_name=db_range,
+            value_input_option="USER_ENTERED",
+        )
 
     header_row = ws.row_values(1)
     header_map = {name: idx + 1 for idx, name in enumerate(header_row) if name}
@@ -1515,16 +1523,16 @@ def main() -> None:
 
     eval_end_col = column_letter(5 + len(EVAL_HEADERS) - 1)  # E
     ws.update(
-        f"E2:{eval_end_col}{last_row}",
-        output_matrix,
+        values=output_matrix,
+        range_name=f"E2:{eval_end_col}{last_row}",
         value_input_option="USER_ENTERED",
     )
 
     if fetch_db_for_this_run:
         db_end_col = column_letter(27 + len(DB_HEADERS) - 1)  # AA
         ws.update(
-            f"AA2:{db_end_col}{last_row}",
-            db_matrix,
+            values=db_matrix,
+            range_name=f"AA2:{db_end_col}{last_row}",
             value_input_option="USER_ENTERED",
         )
 
