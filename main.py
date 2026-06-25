@@ -1373,11 +1373,8 @@ def compute_outputs(db: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def should_fetch_db_for_this_run() -> bool:
-    event_name = os.environ.get("GITHUB_EVENT_NAME", "")
-    if event_name == "schedule":
-        return False
-    if event_name == "workflow_dispatch":
-        return True
+    # schedule でもDB更新判定を行う。
+    # 各銘柄のフル更新可否は should_refresh_db() の7日判定で決める。
     return True
 
 
@@ -1416,42 +1413,30 @@ def row_to_db_dict(header_row: List[str], row_values: List[str]) -> Dict[str, An
 
 
 def db_quality_score(db: Dict[str, Any]) -> int:
-    """既存DBが複数ある場合に、より使えるDBを選ぶためのスコア。
-
-    同一銘柄を複数行で保有している場合、AA以降にも同じtickerが複数存在することがある。
-    その際、後ろの行に古いERROR/PENDING系のDBが残っていても、OKかつ更新日時ありのDBを優先する。
-    """
     score = 0
-    status = str(db.get("data_status") or "").strip().upper()
 
-    if db.get("last_db_update_jst") not in (None, ""):
+    if str(db.get("data_status") or "").strip() == "OK":
         score += 100
-    if status == "OK":
+    if str(db.get("last_db_update_jst") or "").strip():
         score += 50
-    elif status == "ERROR":
-        score -= 50
-    elif status.startswith("PENDING"):
-        score -= 100
+    if safe_float(db.get("current_price")) is not None:
+        score += 20
+    if safe_float(db.get("bps")) is not None:
+        score += 10
+    if safe_float(db.get("eps_ttm")) is not None:
+        score += 10
+    if safe_float(db.get("roe_normalized")) is not None:
+        score += 10
+    if safe_float(db.get("roic_normalized")) is not None:
+        score += 10
 
-    important_keys = [
-        "current_price",
-        "bps",
-        "eps_ttm",
-        "roe_normalized",
-        "roic_normalized",
-        "wacc",
-        "coe",
-        "nopat_ttm",
-    ]
-    score += sum(1 for key in important_keys if db.get(key) not in (None, ""))
     return score
 
 
-def build_db_by_ticker(header_row: List[str], existing_full_rows: List[List[str]]) -> Dict[str, Dict[str, Any]]:
-    """AA以降の既存DBをticker_yfキーで引けるようにする。
-
-    取得処理は元コードのまま維持し、行番号依存で別銘柄DBを誤用する問題だけを防ぐ。
-    """
+def build_db_by_ticker(
+    header_row: List[str],
+    existing_full_rows: List[List[str]],
+) -> Dict[str, Dict[str, Any]]:
     db_by_ticker: Dict[str, Dict[str, Any]] = {}
 
     for row_values in existing_full_rows:
@@ -1462,6 +1447,7 @@ def build_db_by_ticker(header_row: List[str], existing_full_rows: List[List[str]
 
         ticker = normalize_code(ticker_raw)
         current = db_by_ticker.get(ticker)
+
         if current is None or db_quality_score(db) > db_quality_score(current):
             db_by_ticker[ticker] = db
 
@@ -1473,25 +1459,17 @@ def pick_existing_db_for_ticker(
     same_row_db: Dict[str, Any],
     db_by_ticker: Dict[str, Dict[str, Any]],
 ) -> Dict[str, Any]:
-    """この入力行で使う既存DBを選ぶ。
-
-    優先順:
-    1. ticker_yf がA列tickerと一致するDB
-    2. 同じ行のDBが同じtickerなら同じ行のDB
-    3. 同じ行のDBが空なら同じ行の空DB
-    4. 同じ行に別銘柄DBがあるなら使わず空DB
-    """
     ticker_db = db_by_ticker.get(ticker)
     if ticker_db:
-        return dict(ticker_db)
+        return ticker_db
 
     same_row_ticker_raw = str(same_row_db.get("ticker_yf") or "").strip()
     if not same_row_ticker_raw:
-        return dict(same_row_db)
+        return same_row_db
 
     same_row_ticker = normalize_code(same_row_ticker_raw)
     if same_row_ticker == ticker:
-        return dict(same_row_db)
+        return same_row_db
 
     return {}
 
@@ -1524,7 +1502,10 @@ def main() -> None:
 
     last_row = len(input_rows) + 1
     db_last_col_letter = column_letter(27 + len(DB_HEADERS) - 1)
-    existing_full_rows = ws.get(f"A2:{db_last_col_letter}{last_row}")
+
+    # 現在の入力行数だけでなく、旧出力の残骸も読む。
+    # A列から銘柄を削除した場合、最後に E〜R / AA以降 の尾部をクリアするため。
+    existing_full_rows = ws.get(f"A2:{db_last_col_letter}")
     db_by_ticker = build_db_by_ticker(header_row, existing_full_rows)
 
     output_matrix: List[List[Any]] = []
@@ -1555,7 +1536,10 @@ def main() -> None:
         ticker = normalize_code(code)
         existing_db = pick_existing_db_for_ticker(ticker, same_row_db, db_by_ticker)
 
-        refresh_full = fetch_db_for_this_run and should_refresh_db(existing_db, force=force_db_refresh)
+        refresh_full = fetch_db_for_this_run and should_refresh_db(
+            existing_db,
+            force=force_db_refresh,
+        )
 
         db_base = existing_db
         db_base["financial_flag_override"] = existing_db.get("financial_flag_override", "")
@@ -1564,7 +1548,7 @@ def main() -> None:
             fresh = fetch_ticker_data(ticker, refresh_full=refresh_full, config=config, rf_rate=rf_rate)
             if not refresh_full:
                 fresh["last_db_update_jst"] = existing_db.get("last_db_update_jst")
-                if not fresh.get("financial_flag"):
+                if fresh.get("financial_flag") in (None, ""):
                     fresh["financial_flag"] = existing_db.get("financial_flag")
                 if not fresh.get("missing_fields"):
                     fresh["missing_fields"] = existing_db.get("missing_fields", "")
@@ -1583,7 +1567,6 @@ def main() -> None:
             log_error_with_guidance(exc)
 
             db = {key: existing_db.get(key, "") for key in DB_HEADERS}
-
             db["ticker_yf"] = ticker
             db["data_status"] = "ERROR"
             db["calc_error"] = str(exc)
@@ -1608,6 +1591,19 @@ def main() -> None:
             range_name=f"AA2:{db_end_col}{last_row}",
             value_input_option="USER_ENTERED",
         )
+    else:
+        db_end_col = column_letter(27 + len(DB_HEADERS) - 1)
+
+    existing_last_row = len(existing_full_rows) + 1
+    clear_from_row = last_row + 1
+
+    if existing_last_row > last_row:
+        clear_ranges = [
+            f"E{clear_from_row}:{eval_end_col}{existing_last_row}",
+        ]
+        if fetch_db_for_this_run:
+            clear_ranges.append(f"AA{clear_from_row}:{db_end_col}{existing_last_row}")
+        ws.batch_clear(clear_ranges)
 
 
 if __name__ == "__main__":
