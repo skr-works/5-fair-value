@@ -2,18 +2,14 @@ import json
 import logging
 import math
 import os
-import random
 import re
-import time
 from datetime import datetime
-from io import StringIO
 from zoneinfo import ZoneInfo
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 import gspread
 import numpy as np
 import pandas as pd
-import requests
 import yfinance as yf
 from google.oauth2.service_account import Credentials
 from scipy.optimize import bisect
@@ -281,7 +277,7 @@ def parse_datetime_jst(text: Optional[str]) -> Optional[datetime]:
         return None
 
 
-def should_refresh_db(existing_db: Dict[str, Any], force: bool = False) -> bool:
+def should_refresh_db(existing_db: Dict[str, Any], force: bool = False, refresh_days: int = 7) -> bool:
     if force:
         return True
     last_updated = parse_datetime_jst(existing_db.get("last_db_update_jst"))
@@ -289,7 +285,30 @@ def should_refresh_db(existing_db: Dict[str, Any], force: bool = False) -> bool:
         return True
     now = datetime.now(JST)
     age_days = (now - last_updated).days
-    return age_days >= 7
+    return age_days >= refresh_days
+
+
+def get_config_int(config: Dict[str, Any], key: str, default: int) -> int:
+    value = config.get(key, default)
+    try:
+        return int(value)
+    except Exception:
+        return default
+
+
+def get_config_bool(config: Dict[str, Any], key: str, default: bool = False) -> bool:
+    value = config.get(key, default)
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "y", "on"}
+    return default
+
+
+def normalize_data_status(value: Any) -> str:
+    return str(value or "").strip().upper()
 
 
 def market_cap_size_premium(market_cap: Optional[float]) -> float:
@@ -394,7 +413,8 @@ def compute_cagr(values: List[Optional[float]]) -> Optional[float]:
 
 
 def get_optional_config_rate(config: Dict[str, Any], key: str, default: float) -> float:
-    return safe_float(config.get(key)) or default
+    value = safe_float(config.get(key))
+    return default if value is None else value
 
 
 def parse_missing_fields(value: Any) -> Set[str]:
@@ -1372,30 +1392,206 @@ def compute_outputs(db: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-def should_fetch_db_for_this_run() -> bool:
-    event_name = os.environ.get("GITHUB_EVENT_NAME", "")
-    if event_name == "schedule":
-        return False
-    if event_name == "workflow_dispatch":
-        return True
-    return True
+def build_db_by_ticker(header_row: List[str], existing_full_rows: List[List[str]]) -> Dict[str, Dict[str, Any]]:
+    db_by_ticker: Dict[str, Dict[str, Any]] = {}
+    for row in existing_full_rows:
+        row_db = row_to_db_dict(header_row, row)
+        ticker_raw = str(row_db.get("ticker_yf") or "").strip()
+        if not ticker_raw:
+            continue
+        ticker = normalize_code(ticker_raw)
+        db_by_ticker[ticker] = row_db
+    return db_by_ticker
 
 
-def ensure_headers(ws: gspread.Worksheet, include_db_headers: bool = True) -> Tuple[Dict[str, int], Dict[str, int]]:
+def extract_input_records(input_rows: List[List[Any]]) -> List[Dict[str, Any]]:
+    records: List[Dict[str, Any]] = []
+    seen: Set[str] = set()
+
+    for row_index, row in enumerate(input_rows, start=2):
+        code = str(row[0]).strip() if len(row) >= 1 else ""
+        if not code:
+            records.append({
+                "row_index": row_index,
+                "code": "",
+                "ticker": "",
+                "is_blank": True,
+                "is_duplicate": False,
+            })
+            continue
+
+        ticker = normalize_code(code)
+        is_duplicate = ticker in seen
+        if not is_duplicate:
+            seen.add(ticker)
+
+        records.append({
+            "row_index": row_index,
+            "code": code,
+            "ticker": ticker,
+            "is_blank": False,
+            "is_duplicate": is_duplicate,
+        })
+
+    return records
+
+
+def latest_close_from_download(data: pd.DataFrame, ticker: str) -> Optional[float]:
+    if data is None or data.empty:
+        return None
+
+    try:
+        if isinstance(data.columns, pd.MultiIndex):
+            close_data = None
+            level0 = [str(v) for v in data.columns.get_level_values(0)]
+            level1 = [str(v) for v in data.columns.get_level_values(1)]
+
+            if "Close" in level0:
+                close_data = data["Close"]
+            elif "Close" in level1:
+                close_data = data.xs("Close", axis=1, level=1)
+
+            if close_data is None:
+                return None
+
+            if isinstance(close_data, pd.Series):
+                series = close_data.dropna()
+            elif ticker in close_data.columns:
+                series = close_data[ticker].dropna()
+            else:
+                return None
+        else:
+            if "Close" not in data.columns:
+                return None
+            series = data["Close"].dropna()
+
+        if series.empty:
+            return None
+        return safe_float(series.iloc[-1])
+    except Exception:
+        return None
+
+
+def fetch_latest_prices(tickers: List[str]) -> Dict[str, float]:
+    unique_tickers = list(dict.fromkeys([ticker for ticker in tickers if ticker]))
+    if not unique_tickers:
+        return {}
+
+    try:
+        data = yf.download(
+            unique_tickers if len(unique_tickers) > 1 else unique_tickers[0],
+            period="5d",
+            interval="1d",
+            auto_adjust=False,
+            progress=False,
+            threads=False,
+        )
+    except Exception as exc:
+        logger.error("ERROR: 株価一括取得失敗: %s", exc)
+        return {}
+
+    prices: Dict[str, float] = {}
+    for ticker in unique_tickers:
+        price = latest_close_from_download(data, ticker)
+        if price is not None:
+            prices[ticker] = price
+    return prices
+
+
+def full_refresh_priority(
+    ticker: str,
+    existing_db: Dict[str, Any],
+    force_db_refresh: bool,
+    refresh_days: int,
+) -> Optional[Tuple[int, datetime]]:
+    has_existing_ticker = bool(str(existing_db.get("ticker_yf") or "").strip())
+    last_updated = parse_datetime_jst(existing_db.get("last_db_update_jst"))
+    data_status = normalize_data_status(existing_db.get("data_status"))
+
+    if not has_existing_ticker:
+        return 0, datetime.min.replace(tzinfo=JST)
+    if last_updated is None:
+        return 1, datetime.min.replace(tzinfo=JST)
+    if data_status == "ERROR":
+        return 2, last_updated
+    if should_refresh_db(existing_db, force=False, refresh_days=refresh_days):
+        return 3, last_updated
+    if force_db_refresh:
+        return 4, last_updated
+    return None
+
+
+def select_full_refresh_tickers(
+    records: List[Dict[str, Any]],
+    db_by_ticker: Dict[str, Dict[str, Any]],
+    force_db_refresh: bool,
+    refresh_days: int,
+    max_full_refresh_per_run: int,
+) -> Tuple[Set[str], Set[str]]:
+    candidates: List[Tuple[int, datetime, int, str]] = []
+
+    for order, record in enumerate(records):
+        if record.get("is_blank") or record.get("is_duplicate"):
+            continue
+        ticker = str(record.get("ticker") or "")
+        if not ticker:
+            continue
+        existing_db = db_by_ticker.get(ticker, {})
+        priority = full_refresh_priority(ticker, existing_db, force_db_refresh, refresh_days)
+        if priority is None:
+            continue
+        priority_rank, last_updated = priority
+        candidates.append((priority_rank, last_updated, order, ticker))
+
+    candidates.sort(key=lambda item: (item[0], item[1], item[2]))
+
+    if max_full_refresh_per_run <= 0:
+        selected: Set[str] = set()
+    else:
+        selected = {ticker for _, _, _, ticker in candidates[:max_full_refresh_per_run]}
+    all_candidates = {ticker for _, _, _, ticker in candidates}
+    deferred = all_candidates - selected
+    return selected, deferred
+
+
+def duplicate_outputs() -> Dict[str, Any]:
+    outputs = {key: "" for key in EVAL_HEADERS}
+    outputs["総合判定"] = "重複銘柄"
+    outputs["モデル信頼度"] = "低"
+    return outputs
+
+
+def pending_outputs() -> Dict[str, Any]:
+    outputs = {key: "" for key in EVAL_HEADERS}
+    outputs["総合判定"] = "DB更新待ち"
+    outputs["モデル信頼度"] = "低"
+    return outputs
+
+
+def generated_tail_ranges(start_row: int, end_row: int, db_end_col_letter: str) -> List[str]:
+    if end_row < start_row:
+        return []
+    return [
+        f"E{start_row}:R{end_row}",
+        f"AA{start_row}:{db_end_col_letter}{end_row}",
+    ]
+
+
+def ensure_headers(ws: gspread.Worksheet) -> Tuple[Dict[str, int], Dict[str, int]]:
     ws.update(
         values=[EVAL_HEADERS],
         range_name="E1:R1",
         value_input_option="USER_ENTERED",
     )
-    if include_db_headers:
-        db_start_col = 27  # AA
-        db_end_col = db_start_col + len(DB_HEADERS) - 1
-        db_range = f"AA1:{column_letter(db_end_col)}1"
-        ws.update(
-            values=[DB_HEADERS],
-            range_name=db_range,
-            value_input_option="USER_ENTERED",
-        )
+
+    db_start_col = 27  # AA
+    db_end_col = db_start_col + len(DB_HEADERS) - 1
+    db_range = f"AA1:{column_letter(db_end_col)}1"
+    ws.update(
+        values=[DB_HEADERS],
+        range_name=db_range,
+        value_input_option="USER_ENTERED",
+    )
 
     header_row = ws.row_values(1)
     header_map = {name: idx + 1 for idx, name in enumerate(header_row) if name}
@@ -1433,66 +1629,103 @@ def main() -> None:
     spreadsheet = gc.open_by_url(config["spreadsheet_url"])
     ws = spreadsheet.worksheet(config["sheet_name"])
 
-    fetch_db_for_this_run = should_fetch_db_for_this_run()
-    ensure_headers(ws, include_db_headers=fetch_db_for_this_run)
+    ensure_headers(ws)
     header_row = ws.row_values(1)
 
+    db_last_col_letter = column_letter(27 + len(DB_HEADERS) - 1)
+
     input_rows = ws.get("A2:D")
+    existing_db_key_rows = ws.get("AA2:AA")
+
+    current_last_row = len(input_rows) + 1 if input_rows else 1
+    existing_last_row = len(existing_db_key_rows) + 1 if existing_db_key_rows else 1
+    clear_until_row = max(current_last_row, existing_last_row)
+
+    existing_full_rows: List[List[str]] = []
+    if clear_until_row >= 2:
+        existing_full_rows = ws.get(f"A2:{db_last_col_letter}{clear_until_row}")
+
     if not input_rows:
+        tail_ranges = generated_tail_ranges(2, clear_until_row, db_last_col_letter)
+        if tail_ranges:
+            ws.batch_clear(tail_ranges)
         return
 
-    last_row = len(input_rows) + 1
-    db_last_col_letter = column_letter(27 + len(DB_HEADERS) - 1)
-    existing_full_rows = ws.get(f"A2:{db_last_col_letter}{last_row}")
+    records = extract_input_records(input_rows)
+    db_by_ticker = build_db_by_ticker(header_row, existing_full_rows)
 
-    output_matrix: List[List[Any]] = []
-    db_matrix: List[List[Any]] = []
+    active_tickers = [
+        str(record["ticker"])
+        for record in records
+        if not record.get("is_blank") and not record.get("is_duplicate") and record.get("ticker")
+    ]
+    latest_prices = fetch_latest_prices(active_tickers)
 
-    force_db_refresh = bool(config.get("force_db_refresh", False)) and fetch_db_for_this_run
+    force_db_refresh = get_config_bool(config, "force_db_refresh", False)
+    refresh_days = get_config_int(config, "db_refresh_days", 7)
+    max_full_refresh_per_run = get_config_int(config, "max_full_refresh_per_run", 15)
+
+    full_refresh_tickers, deferred_refresh_tickers = select_full_refresh_tickers(
+        records=records,
+        db_by_ticker=db_by_ticker,
+        force_db_refresh=force_db_refresh,
+        refresh_days=refresh_days,
+        max_full_refresh_per_run=max_full_refresh_per_run,
+    )
 
     rf_rate: Optional[float] = None
-    if fetch_db_for_this_run:
+    if full_refresh_tickers:
         try:
             rf_rate = fetch_rf_rate_japan_from_mof()
         except Exception as exc:
             logger.error("ERROR: %s", exc)
             logger.error(error_guidance_message(exc))
-            raise
+            deferred_refresh_tickers.update(full_refresh_tickers)
+            full_refresh_tickers = set()
 
-    for row_idx, row in enumerate(input_rows, start=2):
-        full_row = existing_full_rows[row_idx - 2] if row_idx - 2 < len(existing_full_rows) else []
-        existing_db = row_to_db_dict(header_row, full_row)
+    output_matrix: List[List[Any]] = []
+    db_matrix: List[List[Any]] = []
 
-        code = str(row[0]).strip() if len(row) >= 1 else ""
-        if not code:
+    for record in records:
+        if record.get("is_blank"):
             output_matrix.append([""] * len(EVAL_HEADERS))
-            if fetch_db_for_this_run:
-                db_matrix.append([""] * len(DB_HEADERS))
+            db_matrix.append([""] * len(DB_HEADERS))
             continue
 
-        ticker = normalize_code(code)
+        ticker = str(record.get("ticker") or "")
+        existing_db = db_by_ticker.get(ticker, {})
 
-        existing_ticker_raw = str(existing_db.get("ticker_yf") or "").strip()
-        existing_ticker = normalize_code(existing_ticker_raw) if existing_ticker_raw else ""
-        ticker_changed = fetch_db_for_this_run and bool(existing_ticker) and existing_ticker != ticker
+        if record.get("is_duplicate"):
+            db = {key: existing_db.get(key, "") for key in DB_HEADERS}
+            db["ticker_yf"] = ticker
+            db["data_status"] = "ERROR"
+            db["calc_error"] = "A列に重複銘柄があります"
+            outputs = duplicate_outputs()
+            output_matrix.append([serialize_cell(outputs.get(h)) for h in EVAL_HEADERS])
+            db_matrix.append([serialize_cell(db.get(h)) for h in DB_HEADERS])
+            continue
 
-        refresh_full = fetch_db_for_this_run and (
-            ticker_changed or should_refresh_db(existing_db, force=force_db_refresh)
-        )
-
-        db_base = {key: "" for key in DB_HEADERS} if ticker_changed else existing_db
+        refresh_full = ticker in full_refresh_tickers
+        deferred_refresh = ticker in deferred_refresh_tickers
+        db_base = {key: existing_db.get(key, "") for key in DB_HEADERS}
         db_base["financial_flag_override"] = existing_db.get("financial_flag_override", "")
 
         try:
-            fresh = fetch_ticker_data(ticker, refresh_full=refresh_full, config=config, rf_rate=rf_rate)
-            if not refresh_full:
-                fresh["last_db_update_jst"] = existing_db.get("last_db_update_jst")
-                if not fresh.get("financial_flag"):
-                    fresh["financial_flag"] = existing_db.get("financial_flag")
-                if not fresh.get("missing_fields"):
-                    fresh["missing_fields"] = existing_db.get("missing_fields", "")
-                if not fresh.get("notes"):
-                    fresh["notes"] = existing_db.get("notes", "")
+            if refresh_full:
+                fresh = fetch_ticker_data(ticker, refresh_full=True, config=config, rf_rate=rf_rate)
+            else:
+                fresh = {
+                    "ticker_yf": ticker,
+                }
+                latest_price = latest_prices.get(ticker)
+                if latest_price is not None:
+                    fresh["current_price"] = latest_price
+
+                if not existing_db.get("ticker_yf"):
+                    fresh["data_status"] = "PENDING_REFRESH" if deferred_refresh else "ERROR"
+                    fresh["calc_error"] = "DB初回取得待ち" if deferred_refresh else "DB未取得"
+                else:
+                    fresh["data_status"] = existing_db.get("data_status") or "OK"
 
             db = merge_db(db_base, fresh, refresh_full=refresh_full)
 
@@ -1501,40 +1734,47 @@ def main() -> None:
             if db.get("financial_flag_override") in (None, ""):
                 db["financial_flag_override"] = existing_db.get("financial_flag_override", "")
 
-            outputs = compute_outputs(db)
+            if deferred_refresh and not refresh_full:
+                existing_has_required_cache = bool(existing_db.get("last_db_update_jst"))
+                if not existing_has_required_cache:
+                    outputs = pending_outputs()
+                else:
+                    outputs = compute_outputs(db)
+            else:
+                outputs = compute_outputs(db)
         except Exception as exc:
             log_error_with_guidance(exc)
 
-            if ticker_changed:
-                db = {key: "" for key in DB_HEADERS}
-                db["financial_flag_override"] = existing_db.get("financial_flag_override", "")
-            else:
-                db = {key: existing_db.get(key, "") for key in DB_HEADERS}
-
+            db = {key: existing_db.get(key, "") for key in DB_HEADERS}
             db["ticker_yf"] = ticker
+            db["financial_flag_override"] = existing_db.get("financial_flag_override", "")
             db["data_status"] = "ERROR"
             db["calc_error"] = str(exc)
             outputs = {key: "" for key in EVAL_HEADERS}
             outputs["総合判定"] = "算出不能"
 
         output_matrix.append([serialize_cell(outputs.get(h)) for h in EVAL_HEADERS])
-        if fetch_db_for_this_run:
-            db_matrix.append([serialize_cell(db.get(h)) for h in DB_HEADERS])
+        db_matrix.append([serialize_cell(db.get(h)) for h in DB_HEADERS])
 
+    last_output_row = len(records) + 1
     eval_end_col = column_letter(5 + len(EVAL_HEADERS) - 1)  # E
+    db_end_col = column_letter(27 + len(DB_HEADERS) - 1)  # AA
+
     ws.update(
         values=output_matrix,
-        range_name=f"E2:{eval_end_col}{last_row}",
+        range_name=f"E2:{eval_end_col}{last_output_row}",
+        value_input_option="USER_ENTERED",
+    )
+    ws.update(
+        values=db_matrix,
+        range_name=f"AA2:{db_end_col}{last_output_row}",
         value_input_option="USER_ENTERED",
     )
 
-    if fetch_db_for_this_run:
-        db_end_col = column_letter(27 + len(DB_HEADERS) - 1)  # AA
-        ws.update(
-            values=db_matrix,
-            range_name=f"AA2:{db_end_col}{last_row}",
-            value_input_option="USER_ENTERED",
-        )
+    tail_start_row = last_output_row + 1
+    tail_ranges = generated_tail_ranges(tail_start_row, clear_until_row, db_last_col_letter)
+    if tail_ranges:
+        ws.batch_clear(tail_ranges)
 
 
 if __name__ == "__main__":
