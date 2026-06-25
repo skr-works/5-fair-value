@@ -2,22 +2,23 @@ import json
 import logging
 import math
 import os
+import random
 import re
 import time
-from collections import Counter
 from datetime import datetime
+from io import StringIO
 from zoneinfo import ZoneInfo
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 import gspread
 import numpy as np
 import pandas as pd
+import requests
 import yfinance as yf
 from google.oauth2.service_account import Credentials
 from scipy.optimize import bisect
 
 JST = ZoneInfo("Asia/Tokyo")
-SCRIPT_VERSION = "20260625-v4-diagnostic"
 APP_CONFIG_ENV = "APP_CONFIG_JSON"
 BENCHMARK_TICKER = "1306.T"  # TOPIX ETF as fallback market proxy
 SHEET_SCOPES = [
@@ -148,31 +149,10 @@ LABELS = {
 }
 
 logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s JST %(levelname)s %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
+    level=logging.ERROR,
+    format="%(message)s",
 )
-logging.Formatter.converter = lambda *args: datetime.now(JST).timetuple()
 logger = logging.getLogger(__name__)
-
-
-def diag(message: str, *args: Any) -> None:
-    logger.info("DIAG " + message, *args)
-
-
-def diag_warn(message: str, *args: Any) -> None:
-    logger.warning("DIAG " + message, *args)
-
-
-def sample_values(values: List[Any], limit: int = 20) -> List[Any]:
-    return list(values[:limit])
-
-
-def safe_len(value: Any) -> int:
-    try:
-        return len(value)
-    except Exception:
-        return 0
 
 
 def error_guidance_message(exc: Exception) -> str:
@@ -301,7 +281,7 @@ def parse_datetime_jst(text: Optional[str]) -> Optional[datetime]:
         return None
 
 
-def should_refresh_db(existing_db: Dict[str, Any], force: bool = False, refresh_days: int = 7) -> bool:
+def should_refresh_db(existing_db: Dict[str, Any], force: bool = False) -> bool:
     if force:
         return True
     last_updated = parse_datetime_jst(existing_db.get("last_db_update_jst"))
@@ -309,30 +289,7 @@ def should_refresh_db(existing_db: Dict[str, Any], force: bool = False, refresh_
         return True
     now = datetime.now(JST)
     age_days = (now - last_updated).days
-    return age_days >= refresh_days
-
-
-def get_config_int(config: Dict[str, Any], key: str, default: int) -> int:
-    value = config.get(key, default)
-    try:
-        return int(value)
-    except Exception:
-        return default
-
-
-def get_config_bool(config: Dict[str, Any], key: str, default: bool = False) -> bool:
-    value = config.get(key, default)
-    if isinstance(value, bool):
-        return value
-    if isinstance(value, (int, float)):
-        return bool(value)
-    if isinstance(value, str):
-        return value.strip().lower() in {"1", "true", "yes", "y", "on"}
-    return default
-
-
-def normalize_data_status(value: Any) -> str:
-    return str(value or "").strip().upper()
+    return age_days >= 7
 
 
 def market_cap_size_premium(market_cap: Optional[float]) -> float:
@@ -437,8 +394,7 @@ def compute_cagr(values: List[Optional[float]]) -> Optional[float]:
 
 
 def get_optional_config_rate(config: Dict[str, Any], key: str, default: float) -> float:
-    value = safe_float(config.get(key))
-    return default if value is None else value
+    return safe_float(config.get(key)) or default
 
 
 def parse_missing_fields(value: Any) -> Set[str]:
@@ -1416,398 +1372,30 @@ def compute_outputs(db: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-def build_db_by_ticker(header_row: List[str], existing_full_rows: List[List[str]]) -> Dict[str, Dict[str, Any]]:
-    db_by_ticker: Dict[str, Dict[str, Any]] = {}
-    for row in existing_full_rows:
-        row_db = row_to_db_dict(header_row, row)
-        ticker_raw = str(row_db.get("ticker_yf") or "").strip()
-
-        # 旧データや手動編集で ticker_yf が空でも、同じ行のA列コードから復旧できるようにする。
-        # ただし、DBが空の行もここに入るため、後段で last_db_update_jst 空として初回取得対象にする。
-        if not ticker_raw and len(row) >= 1:
-            ticker_raw = str(row[0] or "").strip()
-
-        if not ticker_raw:
-            continue
-
-        ticker = normalize_code(ticker_raw)
-        existing = db_by_ticker.get(ticker)
-        if existing is None:
-            db_by_ticker[ticker] = row_db
-            continue
-
-        # 同一tickerのDB行が複数ある場合は、更新日時が新しいものを優先する。
-        existing_dt = parse_datetime_jst(existing.get("last_db_update_jst"))
-        row_dt = parse_datetime_jst(row_db.get("last_db_update_jst"))
-        if existing_dt is None or (row_dt is not None and row_dt > existing_dt):
-            db_by_ticker[ticker] = row_db
-
-    return db_by_ticker
+def should_fetch_db_for_this_run() -> bool:
+    event_name = os.environ.get("GITHUB_EVENT_NAME", "")
+    if event_name == "schedule":
+        return False
+    if event_name == "workflow_dispatch":
+        return True
+    return True
 
 
-def extract_input_records(input_rows: List[List[Any]]) -> List[Dict[str, Any]]:
-    records: List[Dict[str, Any]] = []
-
-    for row_index, row in enumerate(input_rows, start=2):
-        code = str(row[0]).strip() if len(row) >= 1 else ""
-        if not code:
-            records.append({
-                "row_index": row_index,
-                "code": "",
-                "ticker": "",
-                "is_blank": True,
-                "is_duplicate": False,
-            })
-            continue
-
-        # 同一銘柄を複数行で保有するケースは正常。
-        # API取得は後段でticker単位に重複排除し、出力は各保有行に同じDBを使い回す。
-        records.append({
-            "row_index": row_index,
-            "code": code,
-            "ticker": normalize_code(code),
-            "is_blank": False,
-            "is_duplicate": False,
-        })
-
-    return records
-
-
-def latest_close_from_download(data: pd.DataFrame, ticker: str) -> Optional[float]:
-    if data is None or data.empty:
-        return None
-
-    try:
-        if isinstance(data.columns, pd.MultiIndex):
-            close_data = None
-            level0 = [str(v) for v in data.columns.get_level_values(0)]
-            level1 = [str(v) for v in data.columns.get_level_values(1)]
-
-            if "Close" in level0:
-                close_data = data["Close"]
-            elif "Close" in level1:
-                close_data = data.xs("Close", axis=1, level=1)
-
-            if close_data is None:
-                return None
-
-            if isinstance(close_data, pd.Series):
-                series = close_data.dropna()
-            elif ticker in close_data.columns:
-                series = close_data[ticker].dropna()
-            else:
-                return None
-        else:
-            if "Close" not in data.columns:
-                return None
-            series = data["Close"].dropna()
-
-        if series.empty:
-            return None
-        return safe_float(series.iloc[-1])
-    except Exception:
-        return None
-
-
-def chunk_list(values: List[str], size: int) -> List[List[str]]:
-    if size <= 0:
-        size = 100
-    return [values[i:i + size] for i in range(0, len(values), size)]
-
-
-def unique_tickers(values: List[str]) -> List[str]:
-    seen: Set[str] = set()
-    result: List[str] = []
-    for value in values:
-        ticker = str(value or "").strip()
-        if not ticker or ticker in seen:
-            continue
-        seen.add(ticker)
-        result.append(ticker)
-    return result
-
-
-def fetch_latest_price_individual(ticker: str) -> Optional[float]:
-    try:
-        hist = yf.Ticker(ticker).history(period="5d", auto_adjust=False)
-        if hist.empty or "Close" not in hist.columns:
-            return None
-        close = hist["Close"].dropna()
-        if close.empty:
-            return None
-        return safe_float(close.iloc[-1])
-    except Exception as exc:
-        logger.error("ERROR: 株価個別取得失敗 %s: %s", ticker, exc)
-        return None
-
-
-def fetch_latest_prices_for_chunk(tickers: List[str]) -> Dict[str, float]:
-    if not tickers:
-        return {}
-
-    try:
-        data = yf.download(
-            tickers if len(tickers) > 1 else tickers[0],
-            period="5d",
-            interval="1d",
-            auto_adjust=False,
-            progress=False,
-            threads=False,
-        )
-    except Exception as exc:
-        logger.error("ERROR: 株価chunk取得失敗 size=%s: %s", len(tickers), exc)
-        return {}
-
-    prices: Dict[str, float] = {}
-    for ticker in tickers:
-        price = latest_close_from_download(data, ticker)
-        if price is not None:
-            prices[ticker] = price
-    return prices
-
-
-def fetch_latest_prices(
-    tickers: List[str],
-    chunk_size: int = 100,
-    retry_chunk_size: int = 25,
-    individual_fallback_limit: int = 50,
-) -> Dict[str, float]:
-    unique_tickers = list(dict.fromkeys([ticker for ticker in tickers if ticker]))
-    diag(
-        "PRICE_FETCH_START total_unique=%s chunk_size=%s retry_chunk_size=%s individual_fallback_limit=%s sample=%s",
-        len(unique_tickers),
-        chunk_size,
-        retry_chunk_size,
-        individual_fallback_limit,
-        sample_values(unique_tickers, 15),
-    )
-    if not unique_tickers:
-        diag("PRICE_FETCH_END total_unique=0 fetched=0 missing=0")
-        return {}
-
-    prices: Dict[str, float] = {}
-    missing_after_retry: List[str] = []
-
-    chunks = chunk_list(unique_tickers, chunk_size)
-    for chunk_no, chunk in enumerate(chunks, start=1):
-        before = len(prices)
-        chunk_prices = fetch_latest_prices_for_chunk(chunk)
-        prices.update(chunk_prices)
-
-        missing = [ticker for ticker in chunk if ticker not in chunk_prices]
-        diag(
-            "PRICE_CHUNK chunk_no=%s/%s size=%s fetched=%s missing=%s missing_sample=%s",
-            chunk_no,
-            len(chunks),
-            len(chunk),
-            len(prices) - before,
-            len(missing),
-            sample_values(missing, 10),
-        )
-        if not missing:
-            continue
-
-        retry_chunks = chunk_list(missing, retry_chunk_size)
-        for retry_no, retry_chunk in enumerate(retry_chunks, start=1):
-            retry_before = len(prices)
-            retry_prices = fetch_latest_prices_for_chunk(retry_chunk)
-            prices.update(retry_prices)
-            retry_missing = [ticker for ticker in retry_chunk if ticker not in retry_prices]
-            missing_after_retry.extend(retry_missing)
-            diag(
-                "PRICE_RETRY parent_chunk=%s retry_no=%s/%s size=%s fetched=%s missing=%s missing_sample=%s",
-                chunk_no,
-                retry_no,
-                len(retry_chunks),
-                len(retry_chunk),
-                len(prices) - retry_before,
-                len(retry_missing),
-                sample_values(retry_missing, 10),
-            )
-
-    fallback_targets = list(dict.fromkeys(missing_after_retry))[:max(0, individual_fallback_limit)]
-    diag(
-        "PRICE_FALLBACK_START targets=%s skipped_by_limit=%s sample=%s",
-        len(fallback_targets),
-        max(0, len(set(missing_after_retry)) - len(fallback_targets)),
-        sample_values(fallback_targets, 20),
-    )
-    fallback_ok = 0
-    for ticker in fallback_targets:
-        if ticker in prices:
-            continue
-        price = fetch_latest_price_individual(ticker)
-        if price is not None:
-            prices[ticker] = price
-            fallback_ok += 1
-
-    missing_final = [ticker for ticker in unique_tickers if ticker not in prices]
-    diag(
-        "PRICE_FETCH_END total_unique=%s fetched=%s fallback_ok=%s missing=%s missing_sample=%s",
-        len(unique_tickers),
-        len(prices),
-        fallback_ok,
-        len(missing_final),
-        sample_values(missing_final, 30),
-    )
-    return prices
-
-
-def full_refresh_priority(
-    ticker: str,
-    existing_db: Dict[str, Any],
-    force_db_refresh: bool,
-    refresh_days: int,
-) -> Optional[Tuple[int, datetime]]:
-    has_existing_ticker = bool(str(existing_db.get("ticker_yf") or "").strip())
-    last_updated = parse_datetime_jst(existing_db.get("last_db_update_jst"))
-    data_status = normalize_data_status(existing_db.get("data_status"))
-
-    if not has_existing_ticker:
-        return 0, datetime.min.replace(tzinfo=JST)
-    if last_updated is None:
-        return 1, datetime.min.replace(tzinfo=JST)
-    if data_status == "ERROR":
-        return 2, last_updated
-    if should_refresh_db(existing_db, force=False, refresh_days=refresh_days):
-        return 3, last_updated
-    if force_db_refresh:
-        return 4, last_updated
-    return None
-
-
-def has_required_db_cache(existing_db: Dict[str, Any]) -> bool:
-    return bool(str(existing_db.get("ticker_yf") or "").strip()) and parse_datetime_jst(existing_db.get("last_db_update_jst")) is not None
-
-
-def select_full_refresh_tickers(
-    records: List[Dict[str, Any]],
-    db_by_ticker: Dict[str, Dict[str, Any]],
-    force_db_refresh: bool,
-    refresh_days: int,
-    max_full_refresh_per_run: int,
-    max_initial_full_refresh_per_run: int,
-) -> Tuple[Set[str], Set[str]]:
-    # 初回・DBキャッシュなしは必ず今回取得する。
-    # ここを上限制御すると、保有一覧の途中から評価が空になる。
-    initial_candidates: List[Tuple[int, str]] = []
-    regular_candidates: List[Tuple[int, datetime, int, str]] = []
-    reason_by_ticker: Dict[str, str] = {}
-    seen: Set[str] = set()
-
-    for order, record in enumerate(records):
-        if record.get("is_blank"):
-            continue
-        ticker = str(record.get("ticker") or "")
-        if not ticker or ticker in seen:
-            continue
-        seen.add(ticker)
-
-        existing_db = db_by_ticker.get(ticker, {})
-        ticker_yf = str(existing_db.get("ticker_yf") or "").strip()
-        last_updated = parse_datetime_jst(existing_db.get("last_db_update_jst"))
-        data_status = normalize_data_status(existing_db.get("data_status"))
-
-        if not ticker_yf:
-            initial_candidates.append((order, ticker))
-            reason_by_ticker[ticker] = "initial_no_ticker_yf"
-            continue
-        if last_updated is None:
-            initial_candidates.append((order, ticker))
-            reason_by_ticker[ticker] = "initial_no_last_db_update_jst"
-            continue
-        if data_status == "PENDING":
-            initial_candidates.append((order, ticker))
-            reason_by_ticker[ticker] = "initial_pending"
-            continue
-
-        if data_status == "ERROR":
-            regular_candidates.append((0, last_updated, order, ticker))
-            reason_by_ticker[ticker] = "regular_error_retry"
-            continue
-
-        if should_refresh_db(existing_db, force=False, refresh_days=refresh_days):
-            regular_candidates.append((1, last_updated, order, ticker))
-            reason_by_ticker[ticker] = "regular_stale_ttl"
-            continue
-
-        if force_db_refresh:
-            regular_candidates.append((2, last_updated, order, ticker))
-            reason_by_ticker[ticker] = "regular_force"
-
-    initial_candidates.sort(key=lambda item: item[0])
-    regular_candidates.sort(key=lambda item: (item[0], item[1], item[2]))
-
-    selected: Set[str] = {ticker for _, ticker in initial_candidates}
-    regular_selected = regular_candidates[:max(0, max_full_refresh_per_run)] if max_full_refresh_per_run > 0 else []
-    if regular_selected:
-        selected.update(ticker for _, _, _, ticker in regular_selected)
-    elif force_db_refresh and max_full_refresh_per_run <= 0:
-        selected.update(ticker for _, _, _, ticker in regular_candidates)
-
-    all_regular = {ticker for _, _, _, ticker in regular_candidates}
-    deferred = all_regular - selected
-
-    selected_reasons = Counter(reason_by_ticker.get(ticker, "unknown") for ticker in selected)
-    deferred_reasons = Counter(reason_by_ticker.get(ticker, "unknown") for ticker in deferred)
-    diag(
-        "FULL_REFRESH_SELECT unique_records=%s db_cache=%s initial_candidates=%s regular_candidates=%s selected=%s deferred=%s force=%s refresh_days=%s max_regular=%s max_initial_config=%s",
-        len(seen),
-        len(db_by_ticker),
-        len(initial_candidates),
-        len(regular_candidates),
-        len(selected),
-        len(deferred),
-        force_db_refresh,
-        refresh_days,
-        max_full_refresh_per_run,
-        max_initial_full_refresh_per_run,
-    )
-    diag("FULL_REFRESH_SELECTED_REASONS %s", dict(selected_reasons))
-    diag("FULL_REFRESH_DEFERRED_REASONS %s", dict(deferred_reasons))
-    diag("FULL_REFRESH_SELECTED_SAMPLE %s", sample_values(sorted(selected), 50))
-    diag("FULL_REFRESH_DEFERRED_SAMPLE %s", sample_values(sorted(deferred), 50))
-
-    return selected, deferred
-
-def duplicate_outputs() -> Dict[str, Any]:
-    # 同一銘柄を複数行で保有するケースは正常。通常はこの関数を使わない。
-    outputs = {key: "" for key in EVAL_HEADERS}
-    outputs["総合判定"] = "算出不能"
-    outputs["モデル信頼度"] = "低"
-    return outputs
-
-def pending_outputs() -> Dict[str, Any]:
-    # 通常運用では使わない。未取得DBは必ずフル取得対象に入れる。
-    outputs = {key: "" for key in EVAL_HEADERS}
-    outputs["総合判定"] = "算出不能"
-    outputs["モデル信頼度"] = "低"
-    return outputs
-
-def generated_tail_ranges(start_row: int, end_row: int, db_end_col_letter: str) -> List[str]:
-    if end_row < start_row:
-        return []
-    return [
-        f"E{start_row}:R{end_row}",
-        f"AA{start_row}:{db_end_col_letter}{end_row}",
-    ]
-
-
-def ensure_headers(ws: gspread.Worksheet) -> Tuple[Dict[str, int], Dict[str, int]]:
+def ensure_headers(ws: gspread.Worksheet, include_db_headers: bool = True) -> Tuple[Dict[str, int], Dict[str, int]]:
     ws.update(
         values=[EVAL_HEADERS],
         range_name="E1:R1",
         value_input_option="USER_ENTERED",
     )
-
-    db_start_col = 27  # AA
-    db_end_col = db_start_col + len(DB_HEADERS) - 1
-    db_range = f"AA1:{column_letter(db_end_col)}1"
-    ws.update(
-        values=[DB_HEADERS],
-        range_name=db_range,
-        value_input_option="USER_ENTERED",
-    )
+    if include_db_headers:
+        db_start_col = 27  # AA
+        db_end_col = db_start_col + len(DB_HEADERS) - 1
+        db_range = f"AA1:{column_letter(db_end_col)}1"
+        ws.update(
+            values=[DB_HEADERS],
+            range_name=db_range,
+            value_input_option="USER_ENTERED",
+        )
 
     header_row = ws.row_values(1)
     header_map = {name: idx + 1 for idx, name in enumerate(header_row) if name}
@@ -1827,6 +1415,87 @@ def row_to_db_dict(header_row: List[str], row_values: List[str]) -> Dict[str, An
     return data
 
 
+def db_quality_score(db: Dict[str, Any]) -> int:
+    """既存DBが複数ある場合に、より使えるDBを選ぶためのスコア。
+
+    同一銘柄を複数行で保有している場合、AA以降にも同じtickerが複数存在することがある。
+    その際、後ろの行に古いERROR/PENDING系のDBが残っていても、OKかつ更新日時ありのDBを優先する。
+    """
+    score = 0
+    status = str(db.get("data_status") or "").strip().upper()
+
+    if db.get("last_db_update_jst") not in (None, ""):
+        score += 100
+    if status == "OK":
+        score += 50
+    elif status == "ERROR":
+        score -= 50
+    elif status.startswith("PENDING"):
+        score -= 100
+
+    important_keys = [
+        "current_price",
+        "bps",
+        "eps_ttm",
+        "roe_normalized",
+        "roic_normalized",
+        "wacc",
+        "coe",
+        "nopat_ttm",
+    ]
+    score += sum(1 for key in important_keys if db.get(key) not in (None, ""))
+    return score
+
+
+def build_db_by_ticker(header_row: List[str], existing_full_rows: List[List[str]]) -> Dict[str, Dict[str, Any]]:
+    """AA以降の既存DBをticker_yfキーで引けるようにする。
+
+    取得処理は元コードのまま維持し、行番号依存で別銘柄DBを誤用する問題だけを防ぐ。
+    """
+    db_by_ticker: Dict[str, Dict[str, Any]] = {}
+
+    for row_values in existing_full_rows:
+        db = row_to_db_dict(header_row, row_values)
+        ticker_raw = str(db.get("ticker_yf") or "").strip()
+        if not ticker_raw:
+            continue
+
+        ticker = normalize_code(ticker_raw)
+        current = db_by_ticker.get(ticker)
+        if current is None or db_quality_score(db) > db_quality_score(current):
+            db_by_ticker[ticker] = db
+
+    return db_by_ticker
+
+
+def pick_existing_db_for_ticker(
+    ticker: str,
+    same_row_db: Dict[str, Any],
+    db_by_ticker: Dict[str, Dict[str, Any]],
+) -> Dict[str, Any]:
+    """この入力行で使う既存DBを選ぶ。
+
+    優先順:
+    1. ticker_yf がA列tickerと一致するDB
+    2. 同じ行のDBが同じtickerなら同じ行のDB
+    3. 同じ行のDBが空なら同じ行の空DB
+    4. 同じ行に別銘柄DBがあるなら使わず空DB
+    """
+    ticker_db = db_by_ticker.get(ticker)
+    if ticker_db:
+        return dict(ticker_db)
+
+    same_row_ticker_raw = str(same_row_db.get("ticker_yf") or "").strip()
+    if not same_row_ticker_raw:
+        return dict(same_row_db)
+
+    same_row_ticker = normalize_code(same_row_ticker_raw)
+    if same_row_ticker == ticker:
+        return dict(same_row_db)
+
+    return {}
+
+
 def serialize_cell(value: Any) -> Any:
     if value is None:
         return ""
@@ -1840,179 +1509,67 @@ def serialize_cell(value: Any) -> Any:
 
 
 def main() -> None:
-    started = time.monotonic()
-    diag("RUN_START version=%s event=%s python=%s cwd=%s", SCRIPT_VERSION, os.environ.get("GITHUB_EVENT_NAME", ""), os.sys.version.split()[0], os.getcwd())
-
     config = load_config()
-    safe_config_keys = sorted([key for key in config.keys() if key != "gcp_service_account"])
-    diag("CONFIG_LOADED keys=%s max_initial=%s max_regular=%s price_chunk=%s retry_chunk=%s fallback_limit=%s force=%s db_refresh_days=%s",
-         safe_config_keys,
-         config.get("max_initial_full_refresh_per_run", "default=1000"),
-         config.get("max_full_refresh_per_run", "default=30"),
-         config.get("price_chunk_size", "default=100"),
-         config.get("price_retry_chunk_size", "default=25"),
-         config.get("price_individual_fallback_limit", "default=50"),
-         config.get("force_db_refresh", "default=false"),
-         config.get("db_refresh_days", "default=7"))
-
     gc = get_client(config)
     spreadsheet = gc.open_by_url(config["spreadsheet_url"])
     ws = spreadsheet.worksheet(config["sheet_name"])
-    diag("SHEET_OPEN spreadsheet_title=%s worksheet_title=%s rows=%s cols=%s", getattr(spreadsheet, "title", ""), ws.title, ws.row_count, ws.col_count)
 
-    ensure_headers(ws)
+    fetch_db_for_this_run = should_fetch_db_for_this_run()
+    ensure_headers(ws, include_db_headers=fetch_db_for_this_run)
     header_row = ws.row_values(1)
-    header_map = {name: idx + 1 for idx, name in enumerate(header_row) if name}
-    missing_eval_headers = [h for h in EVAL_HEADERS if h not in header_map]
-    missing_db_headers = [h for h in DB_HEADERS if h not in header_map]
-    diag("HEADERS header_cells=%s missing_eval=%s missing_db=%s", len(header_row), missing_eval_headers, missing_db_headers)
-
-    db_last_col_letter = column_letter(27 + len(DB_HEADERS) - 1)
 
     input_rows = ws.get("A2:D")
-    existing_db_key_rows = ws.get("AA2:AA")
-
-    current_last_row = len(input_rows) + 1 if input_rows else 1
-    existing_last_row = len(existing_db_key_rows) + 1 if existing_db_key_rows else 1
-    clear_until_row = max(current_last_row, existing_last_row)
-    diag("SHEET_READ input_rows=%s current_last_row=%s existing_db_key_rows=%s existing_last_row=%s clear_until_row=%s db_last_col=%s",
-         len(input_rows), current_last_row, len(existing_db_key_rows), existing_last_row, clear_until_row, db_last_col_letter)
-
-    existing_full_rows: List[List[str]] = []
-    if clear_until_row >= 2:
-        existing_full_rows = ws.get(f"A2:{db_last_col_letter}{clear_until_row}")
-    diag("SHEET_READ_FULL rows=%s cols_max=%s", len(existing_full_rows), max([len(r) for r in existing_full_rows], default=0))
-
     if not input_rows:
-        tail_ranges = generated_tail_ranges(2, clear_until_row, db_last_col_letter)
-        diag_warn("NO_INPUT_ROWS clear_ranges=%s", tail_ranges)
-        if tail_ranges:
-            ws.batch_clear(tail_ranges)
-        diag("RUN_END version=%s status=no_input elapsed_sec=%.2f", SCRIPT_VERSION, time.monotonic() - started)
         return
 
-    records = extract_input_records(input_rows)
-    blank_rows = sum(1 for r in records if r.get("is_blank"))
-    nonblank_records = [r for r in records if not r.get("is_blank") and r.get("ticker")]
-    active_tickers = unique_tickers([str(record["ticker"]) for record in nonblank_records])
-    ticker_row_counts = Counter(str(record["ticker"]) for record in nonblank_records)
-    duplicate_tickers = sorted([ticker for ticker, count in ticker_row_counts.items() if count > 1])
-    diag("INPUT_PARSE total_records=%s blank_rows=%s nonblank_rows=%s unique_tickers=%s duplicate_tickers=%s duplicate_sample=%s first_rows=%s",
-         len(records), blank_rows, len(nonblank_records), len(active_tickers), len(duplicate_tickers), sample_values(duplicate_tickers, 30), sample_values([r.get("ticker") for r in nonblank_records], 30))
-
+    last_row = len(input_rows) + 1
+    db_last_col_letter = column_letter(27 + len(DB_HEADERS) - 1)
+    existing_full_rows = ws.get(f"A2:{db_last_col_letter}{last_row}")
     db_by_ticker = build_db_by_ticker(header_row, existing_full_rows)
-    db_status_counts = Counter(normalize_data_status(db.get("data_status")) for db in db_by_ticker.values())
-    db_missing_last_update = [ticker for ticker, db in db_by_ticker.items() if parse_datetime_jst(db.get("last_db_update_jst")) is None]
-    diag("DB_CACHE_BUILD unique_db_tickers=%s status_counts=%s missing_last_update=%s missing_last_update_sample=%s db_sample=%s",
-         len(db_by_ticker), dict(db_status_counts), len(db_missing_last_update), sample_values(sorted(db_missing_last_update), 30), sample_values(sorted(db_by_ticker.keys()), 30))
-
-    price_chunk_size = get_config_int(config, "price_chunk_size", 100)
-    price_retry_chunk_size = get_config_int(config, "price_retry_chunk_size", 25)
-    price_individual_fallback_limit = get_config_int(config, "price_individual_fallback_limit", 50)
-    latest_prices = fetch_latest_prices(
-        active_tickers,
-        chunk_size=price_chunk_size,
-        retry_chunk_size=price_retry_chunk_size,
-        individual_fallback_limit=price_individual_fallback_limit,
-    )
-    price_missing = [ticker for ticker in active_tickers if ticker not in latest_prices]
-    diag("PRICE_RESULT active=%s fetched=%s missing=%s missing_sample=%s", len(active_tickers), len(latest_prices), len(price_missing), sample_values(price_missing, 50))
-
-    force_db_refresh = get_config_bool(config, "force_db_refresh", False)
-    refresh_days = get_config_int(config, "db_refresh_days", 7)
-    max_full_refresh_per_run = get_config_int(config, "max_full_refresh_per_run", 30)
-    max_initial_full_refresh_per_run = get_config_int(config, "max_initial_full_refresh_per_run", 1000)
-
-    full_refresh_tickers, deferred_refresh_tickers = select_full_refresh_tickers(
-        records=records,
-        db_by_ticker=db_by_ticker,
-        force_db_refresh=force_db_refresh,
-        refresh_days=refresh_days,
-        max_full_refresh_per_run=max_full_refresh_per_run,
-        max_initial_full_refresh_per_run=max_initial_full_refresh_per_run,
-    )
-
-    # 最終安全策：DBキャッシュなし・last_db_update_jst空の銘柄は必ず今回のフル取得対象に入れる。
-    forced_by_safety: List[str] = []
-    for ticker in active_tickers:
-        existing_db = db_by_ticker.get(ticker, {})
-        if not str(existing_db.get("ticker_yf") or "").strip() or parse_datetime_jst(existing_db.get("last_db_update_jst")) is None:
-            if ticker not in full_refresh_tickers:
-                forced_by_safety.append(ticker)
-            full_refresh_tickers.add(ticker)
-            deferred_refresh_tickers.discard(ticker)
-    diag("FULL_REFRESH_AFTER_SAFETY selected=%s deferred=%s forced_by_safety=%s forced_sample=%s selected_sample=%s",
-         len(full_refresh_tickers), len(deferred_refresh_tickers), len(forced_by_safety), sample_values(forced_by_safety, 50), sample_values(sorted(full_refresh_tickers), 50))
-
-    rf_rate: Optional[float] = None
-    rf_rate_ok = False
-    if full_refresh_tickers:
-        try:
-            rf_rate = fetch_rf_rate_japan_from_mof()
-            rf_rate_ok = True
-            diag("RF_RATE_OK value=%s source=%s full_refresh_count=%s", rf_rate, _RF_RATE_SOURCE, len(full_refresh_tickers))
-        except Exception as exc:
-            logger.error("ERROR: %s", exc)
-            logger.error(error_guidance_message(exc))
-            diag_warn("RF_RATE_FAIL full_refresh_skipped=%s reason=%s", len(full_refresh_tickers), exc)
-            deferred_refresh_tickers.update(full_refresh_tickers)
-            full_refresh_tickers = set()
-    else:
-        diag("RF_RATE_SKIP reason=no_full_refresh")
 
     output_matrix: List[List[Any]] = []
     db_matrix: List[List[Any]] = []
-    row_status_counts: Counter[str] = Counter()
-    output_judgement_counts: Counter[str] = Counter()
-    full_refresh_success: List[str] = []
-    full_refresh_fail: List[str] = []
-    existing_cache_no_refresh: List[str] = []
-    no_cache_not_refreshed: List[str] = []
-    banned_outputs: List[Tuple[int, str, str]] = []
 
-    for record in records:
-        row_index = int(record.get("row_index") or 0)
-        if record.get("is_blank"):
+    force_db_refresh = bool(config.get("force_db_refresh", False)) and fetch_db_for_this_run
+
+    rf_rate: Optional[float] = None
+    if fetch_db_for_this_run:
+        try:
+            rf_rate = fetch_rf_rate_japan_from_mof()
+        except Exception as exc:
+            logger.error("ERROR: %s", exc)
+            logger.error(error_guidance_message(exc))
+            raise
+
+    for row_idx, row in enumerate(input_rows, start=2):
+        full_row = existing_full_rows[row_idx - 2] if row_idx - 2 < len(existing_full_rows) else []
+        same_row_db = row_to_db_dict(header_row, full_row)
+
+        code = str(row[0]).strip() if len(row) >= 1 else ""
+        if not code:
             output_matrix.append([""] * len(EVAL_HEADERS))
-            db_matrix.append([""] * len(DB_HEADERS))
-            row_status_counts["blank"] += 1
+            if fetch_db_for_this_run:
+                db_matrix.append([""] * len(DB_HEADERS))
             continue
 
-        ticker = str(record.get("ticker") or "")
-        existing_db = db_by_ticker.get(ticker, {})
+        ticker = normalize_code(code)
+        existing_db = pick_existing_db_for_ticker(ticker, same_row_db, db_by_ticker)
 
-        refresh_full = ticker in full_refresh_tickers
-        deferred_refresh = ticker in deferred_refresh_tickers
-        db_base = {key: existing_db.get(key, "") for key in DB_HEADERS}
+        refresh_full = fetch_db_for_this_run and should_refresh_db(existing_db, force=force_db_refresh)
+
+        db_base = existing_db
         db_base["financial_flag_override"] = existing_db.get("financial_flag_override", "")
 
         try:
-            if refresh_full:
-                diag("ROW_FULL_REFRESH_START row=%s ticker=%s has_existing_ticker=%s last_update=%s data_status=%s price_available=%s",
-                     row_index, ticker, bool(existing_db.get("ticker_yf")), existing_db.get("last_db_update_jst"), existing_db.get("data_status"), ticker in latest_prices)
-                fresh = fetch_ticker_data(ticker, refresh_full=True, config=config, rf_rate=rf_rate)
-                full_refresh_success.append(ticker)
-                row_status_counts["full_refresh"] += 1
-                diag("ROW_FULL_REFRESH_OK row=%s ticker=%s missing_fields=%s data_status=%s current_price=%s last_update=%s",
-                     row_index, ticker, fresh.get("missing_fields"), fresh.get("data_status"), fresh.get("current_price"), fresh.get("last_db_update_jst"))
-            else:
-                fresh = {
-                    "ticker_yf": ticker,
-                }
-                latest_price = latest_prices.get(ticker)
-                if latest_price is not None:
-                    fresh["current_price"] = latest_price
-
-                if not existing_db.get("ticker_yf"):
-                    fresh["data_status"] = "ERROR"
-                    fresh["calc_error"] = "DBキャッシュなし。フル取得対象に漏れています"
-                    no_cache_not_refreshed.append(ticker)
-                    row_status_counts["no_cache_not_refreshed"] += 1
-                    diag_warn("ROW_NO_CACHE_NOT_REFRESHED row=%s ticker=%s deferred=%s rf_rate_ok=%s", row_index, ticker, deferred_refresh, rf_rate_ok)
-                else:
-                    fresh["data_status"] = existing_db.get("data_status") or "OK"
-                    existing_cache_no_refresh.append(ticker)
-                    row_status_counts["existing_cache_no_refresh"] += 1
+            fresh = fetch_ticker_data(ticker, refresh_full=refresh_full, config=config, rf_rate=rf_rate)
+            if not refresh_full:
+                fresh["last_db_update_jst"] = existing_db.get("last_db_update_jst")
+                if not fresh.get("financial_flag"):
+                    fresh["financial_flag"] = existing_db.get("financial_flag")
+                if not fresh.get("missing_fields"):
+                    fresh["missing_fields"] = existing_db.get("missing_fields", "")
+                if not fresh.get("notes"):
+                    fresh["notes"] = existing_db.get("notes", "")
 
             db = merge_db(db_base, fresh, refresh_full=refresh_full)
 
@@ -2024,65 +1581,33 @@ def main() -> None:
             outputs = compute_outputs(db)
         except Exception as exc:
             log_error_with_guidance(exc)
-            full_refresh_fail.append(ticker)
-            row_status_counts["exception"] += 1
-            diag_warn("ROW_EXCEPTION row=%s ticker=%s refresh_full=%s deferred=%s exc_type=%s exc=%s", row_index, ticker, refresh_full, deferred_refresh, type(exc).__name__, exc)
 
             db = {key: existing_db.get(key, "") for key in DB_HEADERS}
+
             db["ticker_yf"] = ticker
-            db["financial_flag_override"] = existing_db.get("financial_flag_override", "")
             db["data_status"] = "ERROR"
             db["calc_error"] = str(exc)
             outputs = {key: "" for key in EVAL_HEADERS}
             outputs["総合判定"] = "算出不能"
 
-        judgement = str(outputs.get("総合判定") or "")
-        output_judgement_counts[judgement] += 1
-        if judgement in {"DB更新待ち", "重複銘柄", "DB未取得"}:
-            banned_outputs.append((row_index, ticker, judgement))
-            diag_warn("BANNED_OUTPUT_DETECTED row=%s ticker=%s judgement=%s version=%s", row_index, ticker, judgement, SCRIPT_VERSION)
-
         output_matrix.append([serialize_cell(outputs.get(h)) for h in EVAL_HEADERS])
-        db_matrix.append([serialize_cell(db.get(h)) for h in DB_HEADERS])
+        if fetch_db_for_this_run:
+            db_matrix.append([serialize_cell(db.get(h)) for h in DB_HEADERS])
 
-    diag("PROCESS_SUMMARY row_status_counts=%s", dict(row_status_counts))
-    diag("PROCESS_REFRESH full_success_unique=%s full_success_rows=%s full_fail=%s no_cache_not_refreshed=%s existing_cache_no_refresh_rows=%s",
-         len(set(full_refresh_success)), len(full_refresh_success), len(full_refresh_fail), len(no_cache_not_refreshed), len(existing_cache_no_refresh))
-    diag("PROCESS_REFRESH_SUCCESS_SAMPLE %s", sample_values(full_refresh_success, 50))
-    diag("PROCESS_REFRESH_FAIL_SAMPLE %s", sample_values(full_refresh_fail, 50))
-    diag("PROCESS_NO_CACHE_NOT_REFRESHED_SAMPLE %s", sample_values(no_cache_not_refreshed, 50))
-    diag("OUTPUT_JUDGEMENT_COUNTS %s", dict(output_judgement_counts))
-    if banned_outputs:
-        diag_warn("BANNED_OUTPUT_SUMMARY count=%s sample=%s", len(banned_outputs), sample_values(banned_outputs, 50))
-    else:
-        diag("BANNED_OUTPUT_SUMMARY count=0")
-
-    last_output_row = len(records) + 1
     eval_end_col = column_letter(5 + len(EVAL_HEADERS) - 1)  # E
-    db_end_col = column_letter(27 + len(DB_HEADERS) - 1)  # AA
-
-    diag("SHEET_WRITE_EVAL range=%s rows=%s cols=%s", f"E2:{eval_end_col}{last_output_row}", len(output_matrix), len(EVAL_HEADERS))
     ws.update(
         values=output_matrix,
-        range_name=f"E2:{eval_end_col}{last_output_row}",
-        value_input_option="USER_ENTERED",
-    )
-    diag("SHEET_WRITE_DB range=%s rows=%s cols=%s", f"AA2:{db_end_col}{last_output_row}", len(db_matrix), len(DB_HEADERS))
-    ws.update(
-        values=db_matrix,
-        range_name=f"AA2:{db_end_col}{last_output_row}",
+        range_name=f"E2:{eval_end_col}{last_row}",
         value_input_option="USER_ENTERED",
     )
 
-    tail_start_row = last_output_row + 1
-    tail_ranges = generated_tail_ranges(tail_start_row, clear_until_row, db_last_col_letter)
-    if tail_ranges:
-        diag("SHEET_CLEAR_TAIL ranges=%s", tail_ranges)
-        ws.batch_clear(tail_ranges)
-    else:
-        diag("SHEET_CLEAR_TAIL ranges=[]")
-
-    diag("RUN_END version=%s status=ok elapsed_sec=%.2f records=%s unique_tickers=%s full_refresh=%s banned_outputs=%s", SCRIPT_VERSION, time.monotonic() - started, len(records), len(active_tickers), len(set(full_refresh_success)), len(banned_outputs))
+    if fetch_db_for_this_run:
+        db_end_col = column_letter(27 + len(DB_HEADERS) - 1)  # AA
+        ws.update(
+            values=db_matrix,
+            range_name=f"AA2:{db_end_col}{last_row}",
+            value_input_option="USER_ENTERED",
+        )
 
 
 if __name__ == "__main__":
