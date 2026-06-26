@@ -1,3 +1,5 @@
+import base64
+import gzip
 import json
 import logging
 import math
@@ -126,6 +128,38 @@ DB_HEADERS = [
     "calc_error",
     "notes",
 ]
+
+# CP〜EF: ticker_yf単位の圧縮履歴DB。既存A〜D/E〜R/AA〜CNには干渉しない。
+HISTORY_START_COL = 94  # CP
+HISTORY_META_COL_COUNT = 3
+HISTORY_KEEP_RECORDS = 2520
+HISTORY_SEGMENT_RECORDS = 63
+HISTORY_SEGMENT_COUNT = 40
+HISTORY_HEADERS = [
+    "hist_ticker_yf",
+    "hist_meta_json",
+    "hist_summary_json",
+] + [f"hist_seg_{i:02d}" for i in range(HISTORY_SEGMENT_COUNT)]
+HISTORY_HORIZONS = [21, 63, 126, 252, 504]
+HISTORY_BUY_CODES = {2, 3, 4}  # 強い割安 / 割安 / やや割安
+HISTORY_SELL_CODES = {6, 7, 8}  # やや割高 / 割高 / かなり割高
+
+JUDGEMENT_TO_CODE = {
+    "算出不能": 0,
+    "見送り": 1,
+    "強い割安": 2,
+    "割安": 3,
+    "やや割安": 4,
+    "妥当": 5,
+    "やや割高": 6,
+    "割高": 7,
+    "かなり割高": 8,
+}
+CODE_TO_JUDGEMENT = {v: k for k, v in JUDGEMENT_TO_CODE.items()}
+CONFIDENCE_TO_CODE = {"低": 1, "中": 2, "高": 3}
+CODE_TO_CONFIDENCE = {v: k for k, v in CONFIDENCE_TO_CODE.items()}
+DATA_STATUS_TO_CODE = {"": 0, "OK": 1, "ERROR": 2}
+
 
 FINANCIAL_KEYWORDS = [
     "bank", "banks", "insurance", "capital markets", "financial services",
@@ -1474,6 +1508,620 @@ def pick_existing_db_for_ticker(
     return {}
 
 
+def get_bool_config(config: Dict[str, Any], key: str, default: bool) -> bool:
+    value = config.get(key, default)
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+    return bool(value)
+
+
+def history_end_col() -> int:
+    return HISTORY_START_COL + len(HISTORY_HEADERS) - 1
+
+
+def history_end_col_letter() -> str:
+    return column_letter(history_end_col())
+
+
+def ensure_history_grid(ws: gspread.Worksheet) -> None:
+    required_cols = history_end_col()
+    if getattr(ws, "col_count", required_cols) < required_cols:
+        ws.add_cols(required_cols - ws.col_count)
+
+
+def ensure_history_headers(ws: gspread.Worksheet) -> None:
+    start = column_letter(HISTORY_START_COL)
+    end = history_end_col_letter()
+    ws.update(
+        values=[HISTORY_HEADERS],
+        range_name=f"{start}1:{end}1",
+        value_input_option="USER_ENTERED",
+    )
+
+
+def safe_json_loads(text: Any, default: Any) -> Any:
+    if text is None:
+        return default
+    s = str(text).strip()
+    if not s:
+        return default
+    try:
+        return json.loads(s)
+    except Exception:
+        return default
+
+
+def safe_json_dumps(value: Any) -> str:
+    return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+
+
+def encode_records(records: List[List[Any]]) -> str:
+    if not records:
+        return ""
+    raw = json.dumps(records, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    compressed = gzip.compress(raw)
+    return base64.b64encode(compressed).decode("ascii")
+
+
+def decode_records(text: Any) -> Optional[List[List[Any]]]:
+    if text is None:
+        return []
+    s = str(text).strip()
+    if not s:
+        return []
+    try:
+        raw = gzip.decompress(base64.b64decode(s.encode("ascii"))).decode("utf-8")
+        records = json.loads(raw)
+        if isinstance(records, list):
+            return records
+        return []
+    except Exception:
+        return None
+
+
+def scaled_int(value: Any, scale: int) -> Optional[int]:
+    val = safe_float(value)
+    if val is None:
+        return None
+    try:
+        return int(round(val * scale))
+    except Exception:
+        return None
+
+
+def unscale_int(value: Any, scale: int) -> Optional[float]:
+    val = safe_float(value)
+    if val is None:
+        return None
+    return val / scale
+
+
+def judgement_to_code(label: Any) -> int:
+    return JUDGEMENT_TO_CODE.get(str(label or "").strip(), 0)
+
+
+def code_to_judgement(code: Any) -> str:
+    return CODE_TO_JUDGEMENT.get(safe_int(code) or 0, "算出不能")
+
+
+def confidence_to_code(label: Any) -> int:
+    return CONFIDENCE_TO_CODE.get(str(label or "").strip(), 0)
+
+
+def data_status_to_code(status: Any) -> int:
+    return DATA_STATUS_TO_CODE.get(str(status or "").strip(), 0)
+
+
+def parse_ymd_date(text: Any) -> Optional[datetime]:
+    if text is None:
+        return None
+    s = str(text).strip()
+    if not s:
+        return None
+    for fmt in ("%Y-%m-%d", "%Y%m%d"):
+        try:
+            return datetime.strptime(s, fmt).replace(tzinfo=JST)
+        except Exception:
+            continue
+    return None
+
+
+def today_ymd() -> str:
+    return datetime.now(JST).strftime("%Y%m%d")
+
+
+def today_iso_date() -> str:
+    return datetime.now(JST).strftime("%Y-%m-%d")
+
+
+def read_history_rows(ws: gspread.Worksheet) -> List[List[str]]:
+    return ws.get(f"{column_letter(HISTORY_START_COL)}2:{history_end_col_letter()}")
+
+
+def blank_history_state(row_number: int, ticker: str) -> Dict[str, Any]:
+    now = datetime.now(JST)
+    return {
+        "row_number": row_number,
+        "ticker": ticker,
+        "meta": {
+            "version": 1,
+            "schema": "hist_v1",
+            "segment_records": HISTORY_SEGMENT_RECORDS,
+            "segment_count": HISTORY_SEGMENT_COUNT,
+            "record_count": 0,
+            "last_price_date": "",
+            "last_update_jst": now.strftime("%Y-%m-%d %H:%M:%S"),
+            "last_active_in_input_date": now.strftime("%Y-%m-%d"),
+            "history_status": "ACTIVE",
+        },
+        "summary": {"version": 1, "status": "ACTIVE", "valid_records": 0},
+        "segments": [""] * HISTORY_SEGMENT_COUNT,
+        "_records": [],
+        "_changed": True,
+        "_decode_error": False,
+    }
+
+
+def build_history_by_ticker(history_rows: List[List[str]]) -> Tuple[Dict[str, Dict[str, Any]], List[int]]:
+    history_by_ticker: Dict[str, Dict[str, Any]] = {}
+    free_rows: List[int] = []
+
+    for offset, row in enumerate(history_rows, start=2):
+        padded = list(row) + [""] * (len(HISTORY_HEADERS) - len(row))
+        ticker_raw = str(padded[0] or "").strip()
+        if not ticker_raw:
+            free_rows.append(offset)
+            continue
+
+        ticker = normalize_code(ticker_raw)
+        meta = safe_json_loads(padded[1], {})
+        summary = safe_json_loads(padded[2], {})
+        if not isinstance(meta, dict):
+            meta = {}
+        if not isinstance(summary, dict):
+            summary = {}
+        segments = padded[3:3 + HISTORY_SEGMENT_COUNT]
+        state = {
+            "row_number": offset,
+            "ticker": ticker,
+            "meta": meta,
+            "summary": summary,
+            "segments": segments,
+            "_records": None,
+            "_changed": False,
+            "_decode_error": False,
+        }
+        # 同一tickerが万一CP以降に重複した場合、先に見つけた履歴行を正とし、後続行は再利用候補にしない。
+        if ticker not in history_by_ticker:
+            history_by_ticker[ticker] = state
+
+    return history_by_ticker, free_rows
+
+
+def get_history_records(state: Dict[str, Any]) -> Optional[List[List[Any]]]:
+    cached = state.get("_records")
+    if cached is not None:
+        return cached
+
+    records: List[List[Any]] = []
+    for seg_text in state.get("segments", []):
+        decoded = decode_records(seg_text)
+        if decoded is None:
+            state["_decode_error"] = True
+            return None
+        records.extend(decoded)
+
+    records = [r for r in records if isinstance(r, list) and len(r) >= 5]
+    records = records[-HISTORY_KEEP_RECORDS:]
+    state["_records"] = records
+    return records
+
+
+def split_records_to_segments(records: List[List[Any]]) -> List[str]:
+    records = records[-HISTORY_KEEP_RECORDS:]
+    segments: List[str] = []
+    for i in range(HISTORY_SEGMENT_COUNT):
+        start = i * HISTORY_SEGMENT_RECORDS
+        end = start + HISTORY_SEGMENT_RECORDS
+        segments.append(encode_records(records[start:end]))
+    return segments
+
+
+def latest_history_record(state: Dict[str, Any]) -> Optional[List[Any]]:
+    records = get_history_records(state)
+    if not records:
+        return None
+    return records[-1]
+
+
+def is_same_snapshot(latest: Optional[List[Any]], new_record: List[Any]) -> bool:
+    if latest is None:
+        return False
+    # dは土日祝のJST日付で変わる可能性があるため、価格・評価・判定・信頼度の同一性を見る。
+    compare_indices = [1, 2, 3, 4, 5]
+    try:
+        return all(latest[i] == new_record[i] for i in compare_indices)
+    except Exception:
+        return False
+
+
+def append_or_replace_history_record(state: Dict[str, Any], new_record: List[Any]) -> bool:
+    records = get_history_records(state)
+    if records is None:
+        return False
+
+    latest = records[-1] if records else None
+    new_date = str(new_record[0])
+
+    if latest is not None and str(latest[0]) == new_date:
+        if latest == new_record:
+            return False
+        records[-1] = new_record
+        state["_records"] = records[-HISTORY_KEEP_RECORDS:]
+        state["_changed"] = True
+        return True
+
+    if is_same_snapshot(latest, new_record):
+        return False
+
+    records.append(new_record)
+    records = records[-HISTORY_KEEP_RECORDS:]
+    state["_records"] = records
+    state["_changed"] = True
+    return True
+
+
+def get_record_before(records: List[List[Any]], horizon: int) -> Optional[List[Any]]:
+    if len(records) <= horizon:
+        return None
+    return records[-1 - horizon]
+
+
+def record_price(record: List[Any]) -> Optional[float]:
+    return unscale_int(record[1] if len(record) > 1 else None, 100)
+
+
+def record_benchmark_price(record: List[Any]) -> Optional[float]:
+    return unscale_int(record[13] if len(record) > 13 else None, 100)
+
+
+def record_judgement_code(record: List[Any]) -> int:
+    return safe_int(record[4] if len(record) > 4 else None) or 0
+
+
+def compute_excess_return(old_record: List[Any], today_record: List[Any]) -> Optional[float]:
+    old_price = record_price(old_record)
+    today_price = record_price(today_record)
+    if old_price in (None, 0) or today_price is None:
+        return None
+    stock_ret = today_price / old_price - 1
+
+    old_bm = record_benchmark_price(old_record)
+    today_bm = record_benchmark_price(today_record)
+    if old_bm in (None, 0) or today_bm is None:
+        return stock_ret
+    bm_ret = today_bm / old_bm - 1
+    return stock_ret - bm_ret
+
+
+def percentile_rank(values: List[float], current: Optional[float]) -> Optional[float]:
+    if current is None or not values:
+        return None
+    clean = sorted(v for v in values if v is not None and not math.isnan(v))
+    if not clean:
+        return None
+    less_equal = sum(1 for v in clean if v <= current)
+    return less_equal / len(clean)
+
+
+def rebuild_history_summary(records: List[List[Any]]) -> Dict[str, Any]:
+    summary: Dict[str, Any] = {
+        "version": 1,
+        "status": "ACTIVE",
+        "valid_records": len(records),
+    }
+    for horizon in HISTORY_HORIZONS:
+        for side in ("buy", "sell"):
+            summary[f"{side}_n_{horizon}"] = 0
+            summary[f"{side}_excess_sum_{horizon}"] = 0.0
+            summary[f"{side}_hit_count_{horizon}"] = 0
+
+    pb_values: List[float] = []
+    pe_values: List[float] = []
+    dy_values: List[float] = []
+
+    for rec in records:
+        pb = unscale_int(rec[6] if len(rec) > 6 else None, 100)
+        pe = unscale_int(rec[7] if len(rec) > 7 else None, 100)
+        dy = unscale_int(rec[10] if len(rec) > 10 else None, 10000)
+        if pb is not None:
+            pb_values.append(pb)
+        if pe is not None:
+            pe_values.append(pe)
+        if dy is not None:
+            dy_values.append(dy)
+
+    for i, old in enumerate(records):
+        code = record_judgement_code(old)
+        if code not in HISTORY_BUY_CODES and code not in HISTORY_SELL_CODES:
+            continue
+        for horizon in HISTORY_HORIZONS:
+            future_index = i + horizon
+            if future_index >= len(records):
+                continue
+            future = records[future_index]
+            excess = compute_excess_return(old, future)
+            if excess is None:
+                continue
+            side = "buy" if code in HISTORY_BUY_CODES else "sell"
+            summary[f"{side}_n_{horizon}"] += 1
+            summary[f"{side}_excess_sum_{horizon}"] += excess
+            if side == "buy" and excess > 0:
+                summary[f"{side}_hit_count_{horizon}"] += 1
+            if side == "sell" and excess < 0:
+                summary[f"{side}_hit_count_{horizon}"] += 1
+
+    latest = records[-1] if records else None
+    latest_pb = unscale_int(latest[6] if latest and len(latest) > 6 else None, 100)
+    latest_pe = unscale_int(latest[7] if latest and len(latest) > 7 else None, 100)
+    latest_dy = unscale_int(latest[10] if latest and len(latest) > 10 else None, 10000)
+    summary["pb_pct_2520"] = percentile_rank(pb_values, latest_pb)
+    summary["pe_pct_2520"] = percentile_rank(pe_values, latest_pe)
+    summary["dy_pct_2520"] = percentile_rank(dy_values, latest_dy)
+    summary["last_update"] = today_iso_date()
+    return summary
+
+
+def summary_avg(summary: Dict[str, Any], key_sum: str, key_n: str) -> Optional[float]:
+    n = safe_int(summary.get(key_n)) or 0
+    if n <= 0:
+        return None
+    total = safe_float(summary.get(key_sum))
+    if total is None:
+        return None
+    return total / n
+
+
+def summary_hit(summary: Dict[str, Any], key_hit: str, key_n: str) -> Optional[float]:
+    n = safe_int(summary.get(key_n)) or 0
+    if n <= 0:
+        return None
+    hit = safe_float(summary.get(key_hit))
+    if hit is None:
+        return None
+    return hit / n
+
+
+def weaken_buy_judgement(label: str) -> str:
+    if label == "強い割安":
+        return "割安"
+    if label == "割安":
+        return "やや割安"
+    if label == "やや割安":
+        return "妥当"
+    return label
+
+
+def weaken_sell_judgement(label: str) -> str:
+    if label == "かなり割高":
+        return "割高"
+    if label == "割高":
+        return "やや割高"
+    if label == "やや割高":
+        return "妥当"
+    return label
+
+
+def apply_history_guardrail(
+    outputs: Dict[str, Any],
+    summary: Dict[str, Any],
+    config: Dict[str, Any],
+) -> Dict[str, Any]:
+    if not get_bool_config(config, "history_guardrail_enabled", True):
+        return outputs
+
+    label = str(outputs.get("総合判定") or "")
+    adjusted = dict(outputs)
+
+    if label in {"強い割安", "割安", "やや割安"}:
+        buy_n_63 = safe_int(summary.get("buy_n_63")) or 0
+        buy_excess_63 = summary_avg(summary, "buy_excess_sum_63", "buy_n_63")
+        buy_hit_63 = summary_hit(summary, "buy_hit_count_63", "buy_n_63")
+
+        buy_n_126 = safe_int(summary.get("buy_n_126")) or 0
+        buy_excess_126 = summary_avg(summary, "buy_excess_sum_126", "buy_n_126")
+
+        buy_n_252 = safe_int(summary.get("buy_n_252")) or 0
+        buy_excess_252 = summary_avg(summary, "buy_excess_sum_252", "buy_n_252")
+
+        should_weaken = False
+        if buy_n_63 >= 8 and buy_excess_63 is not None and buy_hit_63 is not None:
+            should_weaken = should_weaken or (buy_excess_63 < -0.03 and buy_hit_63 < 0.45)
+        if buy_n_126 >= 8 and buy_excess_126 is not None:
+            should_weaken = should_weaken or (buy_excess_126 < -0.05)
+        if buy_n_252 >= 6 and buy_excess_252 is not None:
+            should_weaken = should_weaken or (buy_excess_252 < 0)
+
+        if should_weaken:
+            adjusted["総合判定"] = weaken_buy_judgement(label)
+        return adjusted
+
+    if label in {"かなり割高", "割高", "やや割高"}:
+        sell_n_63 = safe_int(summary.get("sell_n_63")) or 0
+        sell_excess_63 = summary_avg(summary, "sell_excess_sum_63", "sell_n_63")
+        sell_n_126 = safe_int(summary.get("sell_n_126")) or 0
+        sell_excess_126 = summary_avg(summary, "sell_excess_sum_126", "sell_n_126")
+
+        should_weaken = False
+        if sell_n_63 >= 8 and sell_excess_63 is not None:
+            should_weaken = should_weaken or (sell_excess_63 > 0.03)
+        if sell_n_126 >= 8 and sell_excess_126 is not None:
+            should_weaken = should_weaken or (sell_excess_126 > 0.05)
+
+        if should_weaken:
+            adjusted["総合判定"] = weaken_sell_judgement(label)
+        return adjusted
+
+    return adjusted
+
+
+def fetch_benchmark_snapshot(config: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    ticker = str(config.get("benchmark_ticker_yf") or BENCHMARK_TICKER).strip() or BENCHMARK_TICKER
+    try:
+        hist = yf.Ticker(ticker).history(period="5d", auto_adjust=False)
+        if hist.empty or "Close" not in hist.columns:
+            return None
+        closes = hist["Close"].dropna()
+        if closes.empty:
+            return None
+        price = safe_float(closes.iloc[-1])
+        date_value = closes.index[-1]
+        try:
+            price_date = pd.Timestamp(date_value).tz_convert(JST).strftime("%Y%m%d")
+        except Exception:
+            try:
+                price_date = pd.Timestamp(date_value).strftime("%Y%m%d")
+            except Exception:
+                price_date = today_ymd()
+        return {"ticker_yf": ticker, "price": price, "price_date": price_date}
+    except Exception as exc:
+        logger.error("ERROR: benchmark取得失敗: %s", exc)
+        return None
+
+
+def make_history_snapshot(
+    db: Dict[str, Any],
+    outputs: Dict[str, Any],
+    benchmark_snapshot: Optional[Dict[str, Any]],
+) -> Optional[List[Any]]:
+    ticker = str(db.get("ticker_yf") or "").strip()
+    if not ticker:
+        return None
+    if str(db.get("data_status") or "").strip() == "ERROR":
+        return None
+
+    current_price = safe_float(outputs.get("現在株価"))
+    fair_price = safe_float(outputs.get("適正株価"))
+    buy_limit_price = safe_float(outputs.get("買い上限株価"))
+    judgement = str(outputs.get("総合判定") or "").strip()
+    if current_price is None or not judgement:
+        return None
+
+    benchmark_price = None
+    if benchmark_snapshot:
+        benchmark_price = safe_float(benchmark_snapshot.get("price"))
+
+    return [
+        today_ymd(),
+        scaled_int(current_price, 100),
+        scaled_int(fair_price, 100),
+        scaled_int(buy_limit_price, 100),
+        judgement_to_code(judgement),
+        confidence_to_code(outputs.get("モデル信頼度")),
+        scaled_int(db.get("pb_now"), 100),
+        scaled_int(db.get("pe_now"), 100),
+        scaled_int(db.get("roe_normalized"), 10000),
+        scaled_int(db.get("roic_normalized"), 10000),
+        scaled_int(db.get("dividend_yield"), 10000),
+        safe_int(outputs.get("金融業種フラグ")) or safe_int(db.get("financial_flag")) or 0,
+        data_status_to_code(db.get("data_status")),
+        scaled_int(benchmark_price, 100),
+    ]
+
+
+def history_state_to_row_values(state: Dict[str, Any]) -> List[Any]:
+    records = get_history_records(state)
+    if records is not None and state.get("_changed"):
+        records = records[-HISTORY_KEEP_RECORDS:]
+        state["segments"] = split_records_to_segments(records)
+        meta = dict(state.get("meta") or {})
+        meta["version"] = 1
+        meta["schema"] = "hist_v1"
+        meta["segment_records"] = HISTORY_SEGMENT_RECORDS
+        meta["segment_count"] = HISTORY_SEGMENT_COUNT
+        meta["record_count"] = len(records)
+        meta["last_price_date"] = records[-1][0] if records else ""
+        meta["last_update_jst"] = datetime.now(JST).strftime("%Y-%m-%d %H:%M:%S")
+        meta.setdefault("last_active_in_input_date", today_iso_date())
+        meta.setdefault("history_status", "ACTIVE")
+        state["meta"] = meta
+
+    return [
+        state.get("ticker", ""),
+        safe_json_dumps(state.get("meta") or {}),
+        safe_json_dumps(state.get("summary") or {}),
+    ] + list(state.get("segments") or [""] * HISTORY_SEGMENT_COUNT)
+
+
+def allocate_history_state(
+    ticker: str,
+    history_by_ticker: Dict[str, Dict[str, Any]],
+    free_rows: List[int],
+    next_row_holder: Dict[str, int],
+) -> Dict[str, Any]:
+    existing = history_by_ticker.get(ticker)
+    if existing:
+        return existing
+
+    if free_rows:
+        row_number = free_rows.pop(0)
+    else:
+        row_number = next_row_holder["next"]
+        next_row_holder["next"] += 1
+
+    state = blank_history_state(row_number, ticker)
+    history_by_ticker[ticker] = state
+    return state
+
+
+def mark_history_active(state: Dict[str, Any]) -> None:
+    meta = dict(state.get("meta") or {})
+    today = today_iso_date()
+    if meta.get("last_active_in_input_date") != today or meta.get("history_status") != "ACTIVE":
+        meta["last_active_in_input_date"] = today
+        meta["history_status"] = "ACTIVE"
+        meta["last_update_jst"] = datetime.now(JST).strftime("%Y-%m-%d %H:%M:%S")
+        state["meta"] = meta
+        state["_changed"] = True
+
+
+def should_clear_history_row(
+    state: Dict[str, Any],
+    current_tickers: Set[str],
+    config: Dict[str, Any],
+) -> bool:
+    if not get_bool_config(config, "history_auto_delete_stale", True):
+        return False
+    ticker = state.get("ticker")
+    if ticker in current_tickers:
+        return False
+    meta = state.get("meta") or {}
+    last_active = parse_ymd_date(meta.get("last_active_in_input_date"))
+    if last_active is None:
+        return False
+    limit_days = safe_int(config.get("history_inactive_delete_days")) or 3650
+    age_days = (datetime.now(JST) - last_active).days
+    return age_days > limit_days
+
+
+def batch_update_history_rows(ws: gspread.Worksheet, states: List[Dict[str, Any]]) -> None:
+    if not states:
+        return
+    updates = []
+    end_col = history_end_col_letter()
+    for state in states:
+        row_number = state["row_number"]
+        updates.append({
+            "range": f"{column_letter(HISTORY_START_COL)}{row_number}:{end_col}{row_number}",
+            "values": [history_state_to_row_values(state)],
+        })
+    for i in range(0, len(updates), 100):
+        ws.batch_update(updates[i:i + 100], value_input_option="USER_ENTERED")
+
+
+
 def serialize_cell(value: Any) -> Any:
     if value is None:
         return ""
@@ -1494,6 +2142,12 @@ def main() -> None:
 
     fetch_db_for_this_run = should_fetch_db_for_this_run()
     ensure_headers(ws, include_db_headers=fetch_db_for_this_run)
+
+    history_enabled = get_bool_config(config, "history_enabled", True)
+    if history_enabled:
+        ensure_history_grid(ws)
+        ensure_history_headers(ws)
+
     header_row = ws.row_values(1)
 
     input_rows = ws.get("A2:D")
@@ -1508,6 +2162,24 @@ def main() -> None:
     existing_full_rows = ws.get(f"A2:{db_last_col_letter}")
     db_by_ticker = build_db_by_ticker(header_row, existing_full_rows)
 
+    history_rows: List[List[str]] = []
+    history_by_ticker: Dict[str, Dict[str, Any]] = {}
+    free_history_rows: List[int] = []
+    history_states_to_write: Dict[int, Dict[str, Any]] = {}
+    history_rows_to_clear: List[int] = []
+
+    current_tickers: Set[str] = set()
+    for row in input_rows:
+        code = str(row[0]).strip() if len(row) >= 1 else ""
+        if code:
+            current_tickers.add(normalize_code(code))
+
+    if history_enabled:
+        history_rows = read_history_rows(ws)
+        history_by_ticker, free_history_rows = build_history_by_ticker(history_rows)
+
+    next_history_row = {"next": max(len(history_rows) + 2, 2)}
+
     output_matrix: List[List[Any]] = []
     db_matrix: List[List[Any]] = []
 
@@ -1521,6 +2193,10 @@ def main() -> None:
             logger.error("ERROR: %s", exc)
             logger.error(error_guidance_message(exc))
             raise
+
+    benchmark_snapshot = None
+    if history_enabled and get_bool_config(config, "benchmark_enabled", True):
+        benchmark_snapshot = fetch_benchmark_snapshot(config)
 
     for row_idx, row in enumerate(input_rows, start=2):
         full_row = existing_full_rows[row_idx - 2] if row_idx - 2 < len(existing_full_rows) else []
@@ -1544,6 +2220,8 @@ def main() -> None:
         db_base = existing_db
         db_base["financial_flag_override"] = existing_db.get("financial_flag_override", "")
 
+        history_state = history_by_ticker.get(ticker) if history_enabled else None
+
         try:
             fresh = fetch_ticker_data(ticker, refresh_full=refresh_full, config=config, rf_rate=rf_rate)
             if not refresh_full:
@@ -1563,6 +2241,30 @@ def main() -> None:
                 db["financial_flag_override"] = existing_db.get("financial_flag_override", "")
 
             outputs = compute_outputs(db)
+
+            if history_enabled:
+                raw_outputs = dict(outputs)
+                snapshot = make_history_snapshot(db, raw_outputs, benchmark_snapshot)
+
+                if snapshot is not None:
+                    history_state = allocate_history_state(
+                        ticker=ticker,
+                        history_by_ticker=history_by_ticker,
+                        free_rows=free_history_rows,
+                        next_row_holder=next_history_row,
+                    )
+                    mark_history_active(history_state)
+                    changed = append_or_replace_history_record(history_state, snapshot)
+                    records = get_history_records(history_state)
+                    if changed and records is not None:
+                        history_state["summary"] = rebuild_history_summary(records)
+                        history_state["_changed"] = True
+                    if history_state.get("_changed"):
+                        history_states_to_write[history_state["row_number"]] = history_state
+
+                if history_state is not None and get_bool_config(config, "history_guardrail_enabled", True):
+                    outputs = apply_history_guardrail(outputs, history_state.get("summary") or {}, config)
+
         except Exception as exc:
             log_error_with_guidance(exc)
 
@@ -1576,6 +2278,11 @@ def main() -> None:
         output_matrix.append([serialize_cell(outputs.get(h)) for h in EVAL_HEADERS])
         if fetch_db_for_this_run:
             db_matrix.append([serialize_cell(db.get(h)) for h in DB_HEADERS])
+
+    if history_enabled:
+        for state in history_by_ticker.values():
+            if should_clear_history_row(state, current_tickers, config):
+                history_rows_to_clear.append(state["row_number"])
 
     eval_end_col = column_letter(5 + len(EVAL_HEADERS) - 1)  # E
     ws.update(
@@ -1593,6 +2300,15 @@ def main() -> None:
         )
     else:
         db_end_col = column_letter(27 + len(DB_HEADERS) - 1)
+
+    if history_enabled:
+        states_to_write = [state for row_num, state in sorted(history_states_to_write.items()) if row_num not in set(history_rows_to_clear)]
+        batch_update_history_rows(ws, states_to_write)
+
+        if history_rows_to_clear:
+            start_col = column_letter(HISTORY_START_COL)
+            end_col = history_end_col_letter()
+            ws.batch_clear([f"{start_col}{row}:{end_col}{row}" for row in history_rows_to_clear])
 
     existing_last_row = len(existing_full_rows) + 1
     clear_from_row = last_row + 1
